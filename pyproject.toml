@@ -6,9 +6,12 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "datasets>=4.7.0",
+    "lm-eval>=0.4.11",
     "numpy>=2.0",
+    "statsmodels>=0.14.6",
     "tokenizers>=0.22.2",
     "torch>=2.10.0",
     "tqdm>=4.66",
+    "transformers>=5.7.0",
     "wandb>=0.18",
 ]

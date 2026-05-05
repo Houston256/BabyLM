@@ -6,6 +6,9 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "datasets>=4.7.0",
+    "numpy>=2.0",
     "tokenizers>=0.22.2",
     "torch>=2.10.0",
+    "tqdm>=4.66",
+    "wandb>=0.18",
 ]

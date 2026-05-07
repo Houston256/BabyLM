@@ -1,3 +1,4 @@
 [submodule "eval"]
 	path = eval
 	url = https://github.com/babylm-org/babylm-eval.git
+    ignore = untracked

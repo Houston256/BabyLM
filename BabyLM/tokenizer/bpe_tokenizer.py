@@ -2,19 +2,17 @@ import os
 
 from tokenizers import Tokenizer, decoders, models, normalizers, pre_tokenizers, trainers
 
-from BabyLM.config import MODEL_BASE_PATH
 from BabyLM.data_handler.data_handler import load_data
 
 class BabyLMTokenizer:
-    base_path = MODEL_BASE_PATH
-    def __init__(self, vocab_size: int = 32000, save_path: str = ""):
+    def __init__(self, vocab_size: int = 32000, save_path: str = "models/tokenizer.json"):
         self.vocab_size = vocab_size
-        
+
         self.tokenizer = Tokenizer(models.BPE(unk_token="[UNK]"))
         self.tokenizer.normalizer = normalizers.Sequence([normalizers.NFD(), normalizers.StripAccents()])
         self.tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
         self.tokenizer.decoder = decoders.ByteLevel()
-        self.tokenizer_path = os.path.join(MODEL_BASE_PATH, save_path)
+        self.tokenizer_path = save_path
 
     @staticmethod
     def get_training_corpus(dataset, batch_size=1000):
@@ -41,7 +39,7 @@ class BabyLMTokenizer:
         print(f"Tokenizer saved successfully to {self.tokenizer_path}")
 
     @classmethod
-    def load(cls, load_path=os.path.join(MODEL_BASE_PATH, "tokenizer.json")):
+    def load(cls, load_path: str = "models/tokenizer.json"):
         """Loads a pre-trained tokenizer from a file."""
         instance = cls()
         instance.tokenizer = Tokenizer.from_file(load_path)

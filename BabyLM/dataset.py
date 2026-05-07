@@ -9,32 +9,31 @@ class PackedTokenDataset(Dataset):
     def __init__(self, bin_path: str | Path, seq_length: int):
         self.data = np.memmap(bin_path, dtype=np.uint16, mode="r")
         self.seq_length = seq_length
-        self.n_chunks = (len(self.data) - 1) // seq_length
+        self.n_chunks = len(self.data) // seq_length
 
     def __len__(self) -> int:
         return self.n_chunks
 
     def __getitem__(self, idx: int) -> torch.Tensor:
         start = idx * self.seq_length
-        chunk = self.data[start : start + self.seq_length + 1].astype(np.int64)
+        chunk = self.data[start : start + self.seq_length].astype(np.int64)
         return torch.from_numpy(chunk)
 
 
 def apply_mlm_mask(
-    chunks: torch.Tensor,
+    tokens: torch.Tensor,
     mask_token_id: int,
     vocab_size: int,
     mask_prob: float = 0.15,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # chunks: (batch, seq+1)  -> returns inputs, labels both (batch, seq)
-    tokens = chunks[:, :-1]                                              # (batch, seq)
+    # tokens: (batch, seq) -> inputs, labels both (batch, seq)
     B, T = tokens.shape
     device = tokens.device
 
     mask = torch.rand(B, T, device=device) < mask_prob                   # (batch, seq) bool
     labels = torch.where(mask, tokens, torch.full_like(tokens, -100))    # (batch, seq)
 
-    rand = torch.rand(B, T, device=device)                               # (batch, seq)
+    rand = torch.rand(B, T, device=device)
     inputs = tokens.clone()
     inputs[mask & (rand < 0.8)] = mask_token_id
     rand_pick = mask & (rand >= 0.8) & (rand < 0.9)
@@ -43,6 +42,6 @@ def apply_mlm_mask(
     return inputs, labels
 
 
-def make_clm_pair(chunks: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    # chunks: (batch, seq+1) -> inputs, labels both (batch, seq)
-    return chunks[:, :-1].contiguous(), chunks[:, 1:].contiguous()
+def make_clm_pair(tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    # tokens: (batch, seq) -> inputs, labels both (batch, seq); model shifts internally
+    return tokens, tokens

@@ -1,4 +1,10 @@
-gpt-bert-main/
+
+.env
+wandb/
+results/
+models/
+data/
+checkpoints/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

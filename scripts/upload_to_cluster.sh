@@ -2,7 +2,9 @@
 
 # Load credentials from local .env file
 if [ -f .env ]; then
-    export "$(grep -v '^#' .env | xargs)"
+    set -a
+    source .env
+    set +a
 else
     echo "Error: .env file not found. Please copy .env.example to .env and fill in your details."
     exit 1
@@ -29,7 +31,6 @@ rsync -avzP \
     --exclude='data/' \
     --exclude='models/' \
     --exclude='results/' \
-    --exclude='eval/strict/evaluation_data/' \
     --exclude='eval/multilingual/' \
     --exclude='__pycache__/' \
     --exclude='*.pyc' \

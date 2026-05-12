@@ -65,8 +65,6 @@ uv run python main.py tokenize-corpus --tokenizer models/tokenizer.json --output
 # 4. Pretrain
 uv run python main.py pretrain \
     --config configs/a40.json \
-    --batch-size 64 \
-    --max-steps 10000000 \
     --output-dir checkpoints/ \
     --wandb
 

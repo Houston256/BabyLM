@@ -62,7 +62,8 @@ def main():
                 token_str = tokenizer.decode(next_token[0])
                 print(token_str, end="", flush=True)
                 
-                if next_token.item() == tokenizer.eos_token_id:
+                eos = tokenizer.eos_token_id
+                if eos is not None and next_token.item() == eos:
                     break
         print() # New line after completion
 

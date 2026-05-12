@@ -49,7 +49,7 @@ class _Block(nn.Module):
             nn.Linear(cfg.intermediate_size, cfg.hidden_size),
         )
 
-    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor | None = None, is_causal: bool = False) -> torch.Tensor:
         # x: (batch, seq, hidden)
         B, T, C = x.shape
         h = self.norm1(x)
@@ -62,10 +62,10 @@ class _Block(nn.Module):
         # SDPA expects (B, H, T, D)
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
 
-        # 3. Compute Attention
-        # attn_mask is a boolean mask where True means "can attend" and False means "ignore"
+        # 3. Compute Attention. When attn_mask is None and is_causal=True, SDPA
+        # dispatches to the FlashAttention kernel; passing a materialized mask forces math kernel.
         p = self.dropout_p if self.training else 0.0
-        attn = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=p)
+        attn = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=p, is_causal=is_causal)
 
         # 4. Reshape back to (B, T, C)
         attn = attn.transpose(1, 2).reshape(B, T, C)
@@ -79,6 +79,8 @@ class _Block(nn.Module):
 class _GPTBertBase(PreTrainedModel):
     config_class = GPTBertConfig
     base_model_prefix = "gptbert"
+    # transformers v5: dict of {target_param: source_param}. Consumed by
+    # PreTrainedModel.get_expanded_tied_weights_keys -> tie_weights().
     _tied_weights_keys = {"head.weight": "tok_emb.weight"}
 
     def __init__(self, config: GPTBertConfig):
@@ -116,24 +118,23 @@ class _GPTBertBase(PreTrainedModel):
         x = self.drop(self.tok_emb(input_ids) + self.pos_emb(pos))
 
         # --- MASK LOGIC ---
-        # 1. Padding Mask: HF provides attention_mask as (B, T) with 1 for valid, 0 for pad.
-        # We convert it to a boolean mask (B, 1, 1, T) so it broadcasts over heads and queries.
-        # Convention: True = "can attend", False = "ignore" (matches SDPA's bool mask semantics).
+        # Fast path: pure causal with no padding -> hand off to SDPA's `is_causal=True`,
+        # which can dispatch to the FlashAttention kernel. Materializing the triangular
+        # mask would force the slower math kernel.
+        # Convention for the explicit mask: True = "can attend", False = "ignore".
         final_mask = None
-        if attention_mask is not None:
+        sdpa_is_causal = False
+        if attention_mask is None:
+            sdpa_is_causal = is_causal
+        else:
             final_mask = attention_mask.bool().view(B, 1, 1, T)
-
-        # 2. Causal Mask: If in GPT mode, we add a triangular mask (T, T)
-        if is_causal:
-            causal_mask = torch.tril(torch.ones(T, T, device=input_ids.device, dtype=torch.bool))
-            if final_mask is not None:
-                final_mask = final_mask & causal_mask  # Token must be both non-pad AND in the past
-            else:
-                final_mask = causal_mask
+            if is_causal:
+                causal_mask = torch.tril(torch.ones(T, T, device=input_ids.device, dtype=torch.bool))
+                final_mask = final_mask & causal_mask  # non-pad AND in the past
 
         # Run through transformer blocks
         for block in self.blocks:
-            x = block(x, attn_mask=final_mask)
+            x = block(x, attn_mask=final_mask, is_causal=sdpa_is_causal)
 
         # Final LayerNorm and Head
         return self.head(self.norm(x))

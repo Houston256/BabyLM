@@ -20,6 +20,10 @@ class PackedTokenDataset(Dataset):
         return torch.from_numpy(chunk)
 
 
+# Special tokens occupy ids 0..NUM_SPECIAL_TOKENS-1 (see BabyLM/tokenizer/bpe_tokenizer.py).
+NUM_SPECIAL_TOKENS = 5  # [UNK], [CLS], [SEP], [PAD], [MASK]
+
+
 def apply_mlm_mask(
     tokens: torch.Tensor,
     mask_token_id: int,
@@ -37,7 +41,9 @@ def apply_mlm_mask(
     inputs = tokens.clone()
     inputs[mask & (rand < 0.8)] = mask_token_id
     rand_pick = mask & (rand >= 0.8) & (rand < 0.9)
-    inputs[rand_pick] = torch.randint(0, vocab_size, (int(rand_pick.sum()),), device=device)
+    inputs[rand_pick] = torch.randint(
+        NUM_SPECIAL_TOKENS, vocab_size, (int(rand_pick.sum()),), device=device
+    )
 
     return inputs, labels
 

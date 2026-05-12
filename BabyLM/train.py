@@ -22,29 +22,21 @@ def get_device() -> torch.device:
     return torch.device("cpu")
 
 
-def cosine_lr(step: int, max_steps: int, warmup: int, base_lr: float, min_lr: float) -> float:
-    if step < warmup:
-        return base_lr * (step + 1) / warmup
-    progress = (step - warmup) / max(1, max_steps - warmup)
+def cosine_lr(step: int, max_steps: int, warmup_steps: int, base_lr: float, min_lr: float) -> float:
+    if step < warmup_steps:
+        return base_lr * (step + 1) / max(1, warmup_steps)
+    progress = (step - warmup_steps) / max(1, max_steps - warmup_steps)
     return min_lr + 0.5 * (base_lr - min_lr) * (1 + math.cos(math.pi * progress))
 
 
-def warmup_cosine_cooldown_lr(step: int, max_steps: int, warmup_steps: int, cooldown_steps: int, base_lr: float,
-                              min_lr: float) -> float:
-    # Linear Warmup
-    if step < warmup_steps:
-        return base_lr * (step + 1) / max(1, warmup_steps)
+def constant_lr(step: int, max_steps: int, warmup_steps: int, base_lr: float, min_lr: float) -> float:
+    return base_lr
 
-    # Cosine Decay
-    cosine_steps = max_steps - warmup_steps - cooldown_steps
-    if step < warmup_steps + cosine_steps:
-        progress = (step - warmup_steps) / max(1, cosine_steps)
-        return min_lr + 0.5 * (base_lr - min_lr) * (1 + math.cos(math.pi * progress))
 
-    # Linear Cooldown (decaying from min_lr to 0)
-    cooldown_step = step - (max_steps - cooldown_steps)
-    cooldown_progress = cooldown_step / max(1, cooldown_steps)
-    return min_lr * (1.0 - cooldown_progress)
+LR_SCHEDULES = {
+    "cosine": cosine_lr,
+    "constant": constant_lr,
+}
 
 
 def infinite(loader: DataLoader):
@@ -71,14 +63,14 @@ def build_param_groups(model: nn.Module, weight_decay: float) -> list[dict]:
 _IGNORE = {
     "save_every", "wandb", "wandb_project", "run_name",
     "num_workers", "log_every", "output_dir", "train_bin",
-    "tokenizer", "config", "command", "seed", "max_steps",
+    "tokenizer", "config", "command", "seed",
 }
 
 _ABBREV = {
     "vocab_size": "v", "hidden_size": "h", "num_hidden_layers": "l",
     "num_attention_heads": "a", "intermediate_size": "ff",
     "max_position_embeddings": "pos", "dropout": "do",
-    "batch_size": "bs", "warmup_steps": "wu",
+    "batch_size": "bs", "warmup_steps": "wu", "lr_schedule": "sched",
     "lr": "lr", "min_lr_ratio": "mlr", "weight_decay": "wd",
     "grad_clip": "gc", "grad_accum": "ga", "mask_prob": "mp",
     "hybrid_numerator": "hn", "hybrid_denominator": "hd", "seed": "seed",
@@ -99,20 +91,19 @@ def add_pretrain_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--train-bin", type=str, default="data/train.bin")
     p.add_argument("--output-dir", type=str, default="checkpoints/")
     p.add_argument("--batch-size", type=int, default=64)
-    p.add_argument("--max-steps", type=int, default=10_000)
-    p.add_argument("--warmup-steps", type=int, default=500)
 
     p.add_argument("--lr", type=float, default=5e-4)
     p.add_argument("--min-lr-ratio", type=float, default=0.1)
-    p.add_argument("--warmup-ratio", type=float, default=0.016)
-    p.add_argument("--cooldown-ratio", type=float, default=0.016)
+    p.add_argument("--lr-schedule", type=str, default="cosine", choices=sorted(LR_SCHEDULES))
+    p.add_argument("--warmup-steps", type=int, default=300)
 
     p.add_argument("--weight-decay", type=float, default=0.1)
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--grad-accum", type=int, default=1)
     p.add_argument("--mask-prob", type=float, default=0.15)
+    # Default mix matches the GPT-BERT "causal-focus" baseline: ~6.25% MLM, 93.75% CLM.
     p.add_argument("--hybrid-numerator", type=int, default=1)
-    p.add_argument("--hybrid-denominator", type=int, default=2)
+    p.add_argument("--hybrid-denominator", type=int, default=16)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--log-every", type=int, default=20)
@@ -130,6 +121,7 @@ def _build_fast_tokenizer(tokenizer_path: str) -> PreTrainedTokenizerFast:
         sep_token="[SEP]",
         pad_token="[PAD]",
         mask_token="[MASK]",
+        eos_token="[SEP]",
     )
 
 
@@ -154,11 +146,19 @@ def run_pretrain(args: argparse.Namespace) -> None:
     rng = random.Random(args.seed)
 
     cfg = GPTBertConfig.from_json_file(args.config)
+    # Expose both backends to eval pipelines that load via AutoModelForCausalLM
+    # or AutoModelForMaskedLM. By default save_pretrained only records the class
+    # used to save, so MLM-backend eval would fail otherwise.
+    cfg.auto_map = {
+        "AutoConfig": "modeling_gptbert.GPTBertConfig",
+        "AutoModelForCausalLM": "modeling_gptbert.GPTBertForCausalLM",
+        "AutoModelForMaskedLM": "modeling_gptbert.GPTBertForMaskedLM",
+    }
 
     tokenizer = _build_fast_tokenizer(args.tokenizer)
-    if tokenizer.vocab_size != cfg.vocab_size:
+    if len(tokenizer) != cfg.vocab_size:
         raise ValueError(
-            f"tokenizer vocab ({tokenizer.vocab_size}) != model vocab ({cfg.vocab_size})"
+            f"tokenizer vocab ({len(tokenizer)}) != model vocab ({cfg.vocab_size})"
         )
     mask_id = tokenizer.mask_token_id
     if mask_id is None:
@@ -180,6 +180,8 @@ def run_pretrain(args: argparse.Namespace) -> None:
 
     model = GPTBertForCausalLM(cfg).to(device)
     print(f"model params: {model.num_parameters():,}")
+    assert model.head.weight.data_ptr() == model.tok_emb.weight.data_ptr(), \
+        "tok_emb / head weights are not tied"
 
     opt = torch.optim.AdamW(
         build_param_groups(model, args.weight_decay),
@@ -196,15 +198,14 @@ def run_pretrain(args: argparse.Namespace) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     mlm_p = args.hybrid_numerator / args.hybrid_denominator
 
+    # BabyLM 2026 competition rule: max 10 epochs.
     MAX_EPOCHS = 10
     steps_per_epoch = len(dataset) // (args.batch_size * args.grad_accum)
-    max_steps = min(args.max_steps, MAX_EPOCHS * steps_per_epoch)
-    if max_steps < args.max_steps:
-        print(f"capping training at {MAX_EPOCHS} epochs ({max_steps:,} steps, was {args.max_steps:,})")
+    max_steps = MAX_EPOCHS * steps_per_epoch
+    print(f"training for {MAX_EPOCHS} epochs ({max_steps:,} steps), schedule={args.lr_schedule}")
 
-    # Calculate precise step counts for the schedule
-    warmup_steps = int(max_steps * args.warmup_ratio)
-    cooldown_steps = int(max_steps * args.cooldown_ratio)
+    schedule_fn = LR_SCHEDULES[args.lr_schedule]
+    min_lr = args.lr * args.min_lr_ratio
 
     model.train()
     t_start = time.time()
@@ -213,14 +214,7 @@ def run_pretrain(args: argparse.Namespace) -> None:
         is_causal = rng.random() >= mlm_p
         epoch = step // steps_per_epoch if steps_per_epoch > 0 else 0
 
-        lr = warmup_cosine_cooldown_lr(
-            step=step,
-            max_steps=max_steps,
-            warmup_steps=warmup_steps,
-            cooldown_steps=cooldown_steps,
-            base_lr=args.lr,
-            min_lr=args.lr * args.min_lr_ratio
-        )
+        lr = schedule_fn(step, max_steps, args.warmup_steps, args.lr, min_lr)
 
         for g in opt.param_groups:
             g["lr"] = lr

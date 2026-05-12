@@ -12,6 +12,8 @@ uv run python main.py tokenize-corpus
 uv run python main.py pretrain --config configs/small.json --wandb
 
 # 3. Eval: run the strict-small zero-shot suite on a checkpoint dir
+# One-time: unzip the password-protected EWoK fast set (password: BabyLM2025)
+(cd eval/strict && unzip -P BabyLM2025 evaluation_data/fast_eval/ewok_fast.zip)
 ./scripts/eval.sh checkpoints/final fast causal
 
 # 4. Chat: interactive text completion from a checkpoint

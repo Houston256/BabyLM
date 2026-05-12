@@ -29,6 +29,24 @@ def cosine_lr(step: int, max_steps: int, warmup: int, base_lr: float, min_lr: fl
     return min_lr + 0.5 * (base_lr - min_lr) * (1 + math.cos(math.pi * progress))
 
 
+def warmup_cosine_cooldown_lr(step: int, max_steps: int, warmup_steps: int, cooldown_steps: int, base_lr: float,
+                              min_lr: float) -> float:
+    # Linear Warmup
+    if step < warmup_steps:
+        return base_lr * (step + 1) / max(1, warmup_steps)
+
+    # Cosine Decay
+    cosine_steps = max_steps - warmup_steps - cooldown_steps
+    if step < warmup_steps + cosine_steps:
+        progress = (step - warmup_steps) / max(1, cosine_steps)
+        return min_lr + 0.5 * (base_lr - min_lr) * (1 + math.cos(math.pi * progress))
+
+    # Linear Cooldown (decaying from min_lr to 0)
+    cooldown_step = step - (max_steps - cooldown_steps)
+    cooldown_progress = cooldown_step / max(1, cooldown_steps)
+    return min_lr * (1.0 - cooldown_progress)
+
+
 def infinite(loader: DataLoader):
     while True:
         yield from loader
@@ -53,14 +71,14 @@ def build_param_groups(model: nn.Module, weight_decay: float) -> list[dict]:
 _IGNORE = {
     "save_every", "wandb", "wandb_project", "run_name",
     "num_workers", "log_every", "output_dir", "train_bin",
-    "tokenizer", "config", "command", "seed",
+    "tokenizer", "config", "command", "seed", "max_steps",
 }
 
 _ABBREV = {
     "vocab_size": "v", "hidden_size": "h", "num_hidden_layers": "l",
     "num_attention_heads": "a", "intermediate_size": "ff",
     "max_position_embeddings": "pos", "dropout": "do",
-    "batch_size": "bs", "max_steps": "s", "warmup_steps": "wu",
+    "batch_size": "bs", "warmup_steps": "wu",
     "lr": "lr", "min_lr_ratio": "mlr", "weight_decay": "wd",
     "grad_clip": "gc", "grad_accum": "ga", "mask_prob": "mp",
     "hybrid_numerator": "hn", "hybrid_denominator": "hd", "seed": "seed",
@@ -83,14 +101,18 @@ def add_pretrain_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--max-steps", type=int, default=10_000)
     p.add_argument("--warmup-steps", type=int, default=500)
-    p.add_argument("--lr", type=float, default=3e-4)
+
+    p.add_argument("--lr", type=float, default=5e-4)
     p.add_argument("--min-lr-ratio", type=float, default=0.1)
+    p.add_argument("--warmup-ratio", type=float, default=0.016)
+    p.add_argument("--cooldown-ratio", type=float, default=0.016)
+
     p.add_argument("--weight-decay", type=float, default=0.1)
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--grad-accum", type=int, default=1)
     p.add_argument("--mask-prob", type=float, default=0.15)
-    p.add_argument("--hybrid-numerator", type=int, default=15)
-    p.add_argument("--hybrid-denominator", type=int, default=16)
+    p.add_argument("--hybrid-numerator", type=int, default=1)
+    p.add_argument("--hybrid-denominator", type=int, default=2)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--log-every", type=int, default=20)
@@ -112,10 +134,10 @@ def _build_fast_tokenizer(tokenizer_path: str) -> PreTrainedTokenizerFast:
 
 
 def _save_checkpoint(
-    model: GPTBertForCausalLM,
-    tokenizer: PreTrainedTokenizerFast,
-    out_dir: Path,
-    wandb_run_id: str | None,
+        model: GPTBertForCausalLM,
+        tokenizer: PreTrainedTokenizerFast,
+        out_dir: Path,
+        wandb_run_id: str | None,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(out_dir, safe_serialization=True)
@@ -174,13 +196,32 @@ def run_pretrain(args: argparse.Namespace) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     mlm_p = args.hybrid_numerator / args.hybrid_denominator
 
+    MAX_EPOCHS = 10
+    steps_per_epoch = len(dataset) // (args.batch_size * args.grad_accum)
+    max_steps = min(args.max_steps, MAX_EPOCHS * steps_per_epoch)
+    if max_steps < args.max_steps:
+        print(f"capping training at {MAX_EPOCHS} epochs ({max_steps:,} steps, was {args.max_steps:,})")
+
+    # Calculate precise step counts for the schedule
+    warmup_steps = int(max_steps * args.warmup_ratio)
+    cooldown_steps = int(max_steps * args.cooldown_ratio)
+
     model.train()
     t_start = time.time()
 
-    for step in range(args.max_steps):
+    for step in range(max_steps):
         is_causal = rng.random() >= mlm_p
+        epoch = step // steps_per_epoch if steps_per_epoch > 0 else 0
 
-        lr = cosine_lr(step, args.max_steps, args.warmup_steps, args.lr, args.lr * args.min_lr_ratio)
+        lr = warmup_cosine_cooldown_lr(
+            step=step,
+            max_steps=max_steps,
+            warmup_steps=warmup_steps,
+            cooldown_steps=cooldown_steps,
+            base_lr=args.lr,
+            min_lr=args.lr * args.min_lr_ratio
+        )
+
         for g in opt.param_groups:
             g["lr"] = lr
 
@@ -212,9 +253,11 @@ def run_pretrain(args: argparse.Namespace) -> None:
                 "lr": lr,
                 "grad_norm": float(grad_norm),
                 "tokens_per_sec": tokens_seen / elapsed,
+                "epoch": epoch,
             }
             logger.log(metrics, step=step)
-            print(f"step {step:6d} | {tag} | loss {accum_loss:.4f} | lr {lr:.2e} | {metrics['tokens_per_sec']:,.0f} tok/s")
+            print(
+                f"step {step:6d} | epoch {epoch} | {tag} | loss {accum_loss:.4f} | lr {lr:.2e} | {metrics['tokens_per_sec']:,.0f} tok/s")
 
         if step > 0 and step % args.save_every == 0:
             _save_checkpoint(model, tokenizer, output_dir, wandb_run_id)

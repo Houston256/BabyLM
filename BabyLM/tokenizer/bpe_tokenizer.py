@@ -5,7 +5,7 @@ from tokenizers import Tokenizer, decoders, models, normalizers, pre_tokenizers,
 from BabyLM.data_handler.data_handler import load_data
 
 class BabyLMTokenizer:
-    def __init__(self, vocab_size: int = 32000, save_path: str = "models/tokenizer.json"):
+    def __init__(self, vocab_size: int = 8192, save_path: str = "models/tokenizer.json"):
         self.vocab_size = vocab_size
 
         self.tokenizer = Tokenizer(models.BPE(unk_token="[UNK]"))

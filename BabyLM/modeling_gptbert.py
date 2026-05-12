@@ -10,7 +10,7 @@ class GPTBertConfig(PretrainedConfig):
 
     def __init__(
         self,
-        vocab_size: int = 16384,
+        vocab_size: int = 8192,
         hidden_size: int = 384,
         num_hidden_layers: int = 12,
         num_attention_heads: int = 6,

@@ -1,6 +1,6 @@
 #!/bin/bash
 #PBS -N BabyLM_Full_Pipeline
-#PBS -l walltime=12:00:00
+#PBS -l walltime=0:30:00
 #PBS -l select=1:ncpus=4:ngpus=1:mem=32gb:scratch_local=50gb:gpu_mem=40gb
 #PBS -m abe
 #PBS -j oe
@@ -59,14 +59,14 @@ uv sync --link-mode=copy
 # --- Execution ---
 
 # 3. Tokenize
-uv run python main.py train-tokenizer --vocab-size 16384
+uv run python main.py train-tokenizer --vocab-size 8192
 uv run python main.py tokenize-corpus --tokenizer models/tokenizer.json --output data/train.bin
 
 # 4. Pretrain
 uv run python main.py pretrain \
     --config configs/a40.json \
     --batch-size 64 \
-    --max-steps 100000 \
+    --max-steps 10000000 \
     --output-dir checkpoints/ \
     --wandb
 

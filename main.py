@@ -12,7 +12,7 @@ def main():
     subparsers = parser.add_subparsers(dest="command", required=True, help="Available commands")
 
     p_tok = subparsers.add_parser("train-tokenizer", help="Train the tokenizer from scratch")
-    p_tok.add_argument("--vocab-size", type=int, default=32000)
+    p_tok.add_argument("--vocab-size", type=int, default=8192)
     p_tok.add_argument("--save-path", type=str, default="models/tokenizer.json")
     p_tok.add_argument("--visualize-tokenizer", action="store_true")
 

@@ -15,7 +15,7 @@ fi
 
 # Hardcoded project defaults for the team (Praha 1)
 STORAGE_HOST="storage-praha1.metacentrum.cz"
-REMOTE_PATH="/storage/praha1/home/$METACENTRUM_USER/BabyLM/"
+REMOTE_PATH=~"/BabyLM/"
 
 echo "Syncing project to $STORAGE_HOST as $METACENTRUM_USER..."
 

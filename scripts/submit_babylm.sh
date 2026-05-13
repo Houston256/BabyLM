@@ -1,6 +1,6 @@
 #!/bin/bash
 #PBS -N BabyLM_Full_Pipeline
-#PBS -l walltime=0:30:00
+#PBS -l walltime=1:00:00
 #PBS -l select=1:ncpus=4:ngpus=1:mem=32gb:scratch_local=50gb:gpu_mem=40gb
 #PBS -m abe
 #PBS -j oe
@@ -23,11 +23,6 @@ cleanup() {
         mkdir -p "$DATADIR/checkpoints"
         rsync -av "$SCRATCHDIR/$PROJECT_NAME/checkpoints/" "$DATADIR/checkpoints/"
     fi
-    if [ -d "$SCRATCHDIR/$PROJECT_NAME/eval/strict/results" ]; then
-        echo "Syncing eval results back to $DATADIR/results_$START_TIME ..."
-        mkdir -p "$DATADIR/results_$START_TIME"
-        rsync -av "$SCRATCHDIR/$PROJECT_NAME/eval/strict/results/" "$DATADIR/results_$START_TIME/"
-    fi
     clean_scratch
 }
 trap cleanup EXIT
@@ -41,11 +36,17 @@ rsync -av \
     --exclude "wandb/" \
     --exclude ".git/" \
     --exclude ".venv/" \
+    --exclude "eval/" \
+    --exclude "results_*/" \
     --exclude "checkpoints/" \
     --exclude "data/*.bin" \
     "$DATADIR/" "$SCRATCHDIR/$PROJECT_NAME/"
 
 cd "$SCRATCHDIR/$PROJECT_NAME"
+
+# eval/ is excluded from rsync (large eval data lives in $DATADIR). Symlink it
+# in so train.py's inline eval block can resolve scripts/eval.sh -> eval/strict/.
+ln -snf "$DATADIR/eval" eval
 
 # 2. Setup Environment
 echo "Setting up environment..."
@@ -62,14 +63,14 @@ uv sync --link-mode=copy
 uv run python main.py train-tokenizer --vocab-size 8192
 uv run python main.py tokenize-corpus --tokenizer models/tokenizer.json --output data/train.bin
 
-# 4. Pretrain
+# 4. Pretrain + inline eval (logs eval metrics to the live wandb run before finishing).
+# MLM pseudo-likelihood scoring often beats causal on BLiMP for hybrid models, so
+# train.py runs both backends when --eval is not 'none'.
 uv run python main.py pretrain \
     --config configs/a40.json \
     --output-dir checkpoints/ \
-    --wandb
-
-# 5. Evaluation
-CKPT_DIR=$(find checkpoints/ -mindepth 1 -maxdepth 1 -type d | head -1)
-bash scripts/eval.sh "$CKPT_DIR" fast causal
+    --wandb \
+    --max-epochs 10 \
+    --eval fast
 
 echo "All steps completed successfully at $(date)"

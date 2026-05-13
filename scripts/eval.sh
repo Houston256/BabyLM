@@ -30,10 +30,9 @@ case "$MODE" in
     *)    echo "unknown mode: $MODE (expected fast|full)" >&2; exit 2 ;;
 esac
 
-if [[ -f "$CKPT_DIR/wandb_run_id.txt" ]]; then
+if [[ -f "$CKPT_DIR/wandb_run_id.txt" && "${SKIP_WANDB:-0}" != "1" ]]; then
     (cd "$REPO_ROOT" && uv run python scripts/wandb_report_eval.py \
         --results-dir "$EVAL_DIR/results" \
         --model-name "$(basename "$CKPT_DIR")" \
-        --backend "$BACKEND" \
         --run-id "$(cat "$CKPT_DIR/wandb_run_id.txt")")
 fi

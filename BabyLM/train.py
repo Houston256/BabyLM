@@ -1,6 +1,8 @@
 import argparse
 import math
+import os
 import random
+import subprocess
 import time
 from pathlib import Path
 
@@ -10,8 +12,11 @@ from torch.utils.data import DataLoader
 from transformers import PreTrainedTokenizerFast
 
 from BabyLM.dataset import PackedTokenDataset, apply_mlm_mask, make_clm_pair
+from BabyLM.eval_report import model_results_dir, parse_eval_results
 from BabyLM.logger import build_logger
 from BabyLM.modeling_gptbert import GPTBertConfig, GPTBertForCausalLM
+
+EVAL_BACKENDS = ("causal", "mlm")
 
 
 def get_device() -> torch.device:
@@ -63,7 +68,7 @@ def build_param_groups(model: nn.Module, weight_decay: float) -> list[dict]:
 _IGNORE = {
     "save_every", "wandb", "wandb_project", "run_name",
     "num_workers", "log_every", "output_dir", "train_bin",
-    "tokenizer", "config", "command", "seed",
+    "tokenizer", "config", "command", "seed", "eval",
 }
 
 _ABBREV = {
@@ -108,9 +113,12 @@ def add_pretrain_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--log-every", type=int, default=20)
     p.add_argument("--save-every", type=int, default=1_000)
+    p.add_argument("--max-epochs", type=int, default=10)
     p.add_argument("--wandb", action="store_true")
     p.add_argument("--wandb-project", type=str, default="babylm")
     p.add_argument("--run-name", type=str, default=None)
+    p.add_argument("--eval", type=str, default="none", choices=("none", "fast", "full"),
+                   help="run zero-shot eval on the final checkpoint (both backends) before finishing wandb")
 
 
 def _build_fast_tokenizer(tokenizer_path: str) -> PreTrainedTokenizerFast:
@@ -199,10 +207,9 @@ def run_pretrain(args: argparse.Namespace) -> None:
     mlm_p = args.hybrid_numerator / args.hybrid_denominator
 
     # BabyLM 2026 competition rule: max 10 epochs.
-    MAX_EPOCHS = 10
     steps_per_epoch = len(dataset) // (args.batch_size * args.grad_accum)
-    max_steps = MAX_EPOCHS * steps_per_epoch
-    print(f"training for {MAX_EPOCHS} epochs ({max_steps:,} steps), schedule={args.lr_schedule}")
+    max_steps = args.max_epochs * steps_per_epoch
+    print(f"training for {args.max_epochs} epochs ({max_steps:,} steps), schedule={args.lr_schedule}")
 
     schedule_fn = LR_SCHEDULES[args.lr_schedule]
     min_lr = args.lr * args.min_lr_ratio
@@ -242,7 +249,6 @@ def run_pretrain(args: argparse.Namespace) -> None:
             tokens_seen = (step + 1) * args.batch_size * args.grad_accum * cfg.max_position_embeddings
             tag = "clm" if is_causal else "mlm"
             metrics = {
-                "loss": accum_loss,
                 f"loss/{tag}": accum_loss,
                 "lr": lr,
                 "grad_norm": float(grad_norm),
@@ -259,7 +265,32 @@ def run_pretrain(args: argparse.Namespace) -> None:
 
     _save_checkpoint(model, tokenizer, output_dir, wandb_run_id)
     print(f"saved {output_dir}")
+
+    if args.eval != "none":
+        _run_eval_and_log(args.eval, output_dir, logger, step=max_steps)
+
     logger.finish()
+
+
+def _run_eval_and_log(mode: str, ckpt_dir: Path, logger, step: int) -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    eval_sh = repo_root / "scripts" / "eval.sh"
+    env = {**os.environ, "SKIP_WANDB": "1"}
+    for backend in EVAL_BACKENDS:
+        print(f"[eval] running {mode} {backend}")
+        rc = subprocess.run([str(eval_sh), str(ckpt_dir), mode, backend], env=env).returncode
+        if rc != 0:
+            print(f"[eval] {mode} {backend} exited with code {rc}")
+
+    results_root = repo_root / "eval" / "strict" / "results"
+    results_dir = model_results_dir(results_root, ckpt_dir.name)
+    metrics = parse_eval_results(results_dir)
+    if not metrics:
+        print(f"[eval] no metrics parsed from {results_dir}")
+        return
+    print(f"[eval] logging {len(metrics)} metrics to wandb")
+    logger.log(metrics, step=step)
+    logger.update_summary(metrics)
 
 
 if __name__ == "__main__":

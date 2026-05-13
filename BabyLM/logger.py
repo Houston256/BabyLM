@@ -4,6 +4,7 @@ from typing import Protocol
 class Logger(Protocol):
     def update_config(self, cfg: dict) -> None: ...
     def log(self, metrics: dict, step: int) -> None: ...
+    def update_summary(self, metrics: dict) -> None: ...
     def finish(self) -> None: ...
 
 
@@ -12,6 +13,9 @@ class NoopLogger:
         pass
 
     def log(self, metrics: dict, step: int) -> None:
+        pass
+
+    def update_summary(self, metrics: dict) -> None:
         pass
 
     def finish(self) -> None:
@@ -30,6 +34,9 @@ class WandbLogger:
 
     def log(self, metrics: dict, step: int) -> None:
         self.run.log(metrics, step=step)
+
+    def update_summary(self, metrics: dict) -> None:
+        self.run.summary.update(metrics)
 
     def finish(self) -> None:
         self.run.finish()

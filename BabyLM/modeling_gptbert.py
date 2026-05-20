@@ -5,6 +5,44 @@ from transformers import PretrainedConfig, PreTrainedModel
 from transformers.modeling_outputs import CausalLMOutput, MaskedLMOutput
 
 
+class RotaryEmbedding(nn.Module):
+    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
+        super().__init__()
+        self.dim = dim
+        self.max_position_embeddings = max_position_embeddings
+        self.base = base
+        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, dtype=torch.float32, device=device) / self.dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self._set_cos_sin_cache(seq_len=max_position_embeddings, device=self.inv_freq.device, dtype=torch.float32)
+
+    def _set_cos_sin_cache(self, seq_len, device, dtype):
+        self.max_seq_len_cached = seq_len
+        t = torch.arange(self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype)
+        freqs = torch.outer(t, self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos_cached", emb.cos()[None, None, :, :].to(dtype), persistent=False)
+        self.register_buffer("sin_cached", emb.sin()[None, None, :, :].to(dtype), persistent=False)
+
+    def forward(self, x, seq_len=None):
+        if seq_len > self.max_seq_len_cached:
+            self._set_cos_sin_cache(seq_len=seq_len, device=x.device, dtype=x.dtype)
+        return (
+            self.cos_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
+            self.sin_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
+        )
+
+def rotate_half(x):
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+def apply_rotary_pos_emb(q, k, cos, sin):
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
 class GPTBertConfig(PretrainedConfig):
     model_type = "gptbert"
 
@@ -17,6 +55,8 @@ class GPTBertConfig(PretrainedConfig):
         intermediate_size: int = 1024,
         max_position_embeddings: int = 512,
         dropout: float = 0.1,
+        use_rope: bool = True,
+        rope_base: float = 10000.0,
         **kwargs,
     ):
         # Tie word embeddings is standard for small models to save parameters
@@ -29,6 +69,8 @@ class GPTBertConfig(PretrainedConfig):
         self.intermediate_size = intermediate_size
         self.max_position_embeddings = max_position_embeddings
         self.dropout = dropout
+        self.use_rope = use_rope
+        self.rope_base = rope_base
 
 
 class _Block(nn.Module):
@@ -49,7 +91,7 @@ class _Block(nn.Module):
             nn.Linear(cfg.intermediate_size, cfg.hidden_size),
         )
 
-    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor | None = None, is_causal: bool = False) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor | None = None, is_causal: bool = False, rotary_emb_vals: tuple[torch.Tensor, torch.Tensor] | None = None) -> torch.Tensor:
         # x: (batch, seq, hidden)
         B, T, C = x.shape
         h = self.norm1(x)
@@ -61,6 +103,11 @@ class _Block(nn.Module):
         # 2. Transpose for PyTorch's Scaled Dot Product Attention (SDPA)
         # SDPA expects (B, H, T, D)
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+
+        # Apply RoPE if provided
+        if rotary_emb_vals is not None:
+            cos, sin = rotary_emb_vals
+            q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
         # 3. Compute Attention. When attn_mask is None and is_causal=True, SDPA
         # dispatches to the FlashAttention kernel; passing a materialized mask forces math kernel.
@@ -88,6 +135,16 @@ class _GPTBertBase(PreTrainedModel):
         self.tok_emb = nn.Embedding(config.vocab_size, config.hidden_size)
         self.pos_emb = nn.Embedding(config.max_position_embeddings, config.hidden_size)
         self.drop = nn.Dropout(config.dropout)
+
+        self.use_rope = getattr(config, "use_rope", True)
+        if self.use_rope:
+            head_dim = config.hidden_size // config.num_attention_heads
+            self.rotary_emb = RotaryEmbedding(
+                head_dim,
+                max_position_embeddings=config.max_position_embeddings,
+                base=getattr(config, "rope_base", 10000.0)
+            )
+
         self.blocks = nn.ModuleList([_Block(config) for _ in range(config.num_hidden_layers)])
         self.norm = nn.LayerNorm(config.hidden_size)
         self.head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -115,7 +172,15 @@ class _GPTBertBase(PreTrainedModel):
     def _backbone(self, input_ids: torch.Tensor, attention_mask: torch.Tensor | None, is_causal: bool) -> torch.Tensor:
         B, T = input_ids.shape
         pos = torch.arange(T, device=input_ids.device)
-        x = self.drop(self.tok_emb(input_ids) + self.pos_emb(pos))
+
+        x = self.tok_emb(input_ids)
+        if not self.use_rope:
+            x = x + self.pos_emb(pos)
+        x = self.drop(x)
+
+        rotary_emb_vals = None
+        if self.use_rope:
+            rotary_emb_vals = self.rotary_emb(x, seq_len=T)
 
         # --- MASK LOGIC ---
         # Fast path: pure causal with no padding -> hand off to SDPA's `is_causal=True`,
@@ -134,7 +199,7 @@ class _GPTBertBase(PreTrainedModel):
 
         # Run through transformer blocks
         for block in self.blocks:
-            x = block(x, attn_mask=final_mask, is_causal=sdpa_is_causal)
+            x = block(x, attn_mask=final_mask, is_causal=sdpa_is_causal, rotary_emb_vals=rotary_emb_vals)
 
         # Final LayerNorm and Head
         return self.head(self.norm(x))

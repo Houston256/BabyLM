@@ -26,6 +26,7 @@ echo "Syncing project to $STORAGE_HOST as $METACENTRUM_USER..."
 rsync -avzP \
     --exclude='.venv/' \
     --exclude='.git/' \
+    --exclude='.idea/' \
     --exclude='wandb/' \
     --exclude='checkpoints/' \
     --exclude='data/' \

@@ -275,10 +275,9 @@ def run_pretrain(args: argparse.Namespace) -> None:
 def _run_eval_and_log(mode: str, ckpt_dir: Path, logger, step: int) -> None:
     repo_root = Path(__file__).resolve().parents[1]
     eval_sh = repo_root / "scripts" / "eval.sh"
-    env = {**os.environ, "SKIP_WANDB": "1"}
     for backend in EVAL_BACKENDS:
         print(f"[eval] running {mode} {backend}")
-        rc = subprocess.run([str(eval_sh), str(ckpt_dir), mode, backend], env=env).returncode
+        rc = subprocess.run([str(eval_sh), str(ckpt_dir), mode, backend]).returncode
         if rc != 0:
             print(f"[eval] {mode} {backend} exited with code {rc}")
 

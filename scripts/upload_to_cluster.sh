@@ -24,9 +24,7 @@ echo "Syncing project to $STORAGE_HOST as $METACENTRUM_USER..."
 #ssh "$METACENTRUM_USER@$STORAGE_HOST" "mkdir -p $REMOTE_PATH"
 
 rsync -avzP \
-    --exclude='.venv/' \
-    --exclude='.git/' \
-    --exclude='.idea/' \
+    --exclude='/.*/' \
     --exclude='wandb/' \
     --exclude='checkpoints/' \
     --exclude='data/' \

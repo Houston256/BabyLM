@@ -28,6 +28,10 @@ class WandbLogger:
 
         self._wandb = wandb
         self.run = wandb.init(project=project, name=name)
+        # Anchor all metrics to tokens_seen so runs with different batch sizes
+        # / grad-accum settings line up on the same x-axis in the dashboard.
+        wandb.define_metric("tokens_seen")
+        wandb.define_metric("*", step_metric="tokens_seen")
 
     def update_config(self, cfg: dict) -> None:
         self.run.config.update(cfg, allow_val_change=True)

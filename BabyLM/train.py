@@ -1,6 +1,5 @@
 import argparse
 import math
-import os
 import random
 import subprocess
 import time
@@ -65,38 +64,36 @@ def build_param_groups(model: nn.Module, weight_decay: float) -> list[dict]:
     ]
 
 
-_IGNORE = {
-    "save_every", "wandb", "wandb_project", "run_name",
-    "num_workers", "log_every", "output_dir", "train_bin",
-    "tokenizer", "config", "command", "seed", "eval",
-}
-
+# Whitelist of fields that contribute to the checkpoint dir name.
 _ABBREV = {
-    "vocab_size": "v", "hidden_size": "h", "num_hidden_layers": "l",
-    "num_attention_heads": "a", "intermediate_size": "ff",
-    "max_position_embeddings": "pos", "dropout": "do",
+    # CLI args (training hyperparams)
     "batch_size": "bs", "warmup_steps": "wu", "lr_schedule": "sched",
     "lr": "lr", "min_lr_ratio": "mlr", "weight_decay": "wd",
     "grad_clip": "gc", "grad_accum": "ga", "mask_prob": "mp",
-    "hybrid_numerator": "hn", "hybrid_denominator": "hd", "seed": "seed",
+    "hybrid_numerator": "hn", "hybrid_denominator": "hd",
+    "max_epochs": "max_epochs",
+    "seed": "s",
+    # architecture
+    "vocab_size": "v", "hidden_size": "h", "num_hidden_layers": "l",
+    "num_attention_heads": "a", "intermediate_size": "ff",
+    "max_position_embeddings": "pos", "dropout": "do",
+    "pos_emb": "pos_emb", "rope_base": "rb",
+    "rope_partial_factor": "rp", "attn_dropout": "ad",
+    "mlp_type": "mlp", "init_scheme": "init",
 }
 
 
 def _run_name(args: argparse.Namespace) -> str:
-    return "_".join(
-        f"{_ABBREV.get(k, k)}{v}"
-        for k, v in vars(args).items()
-        if k not in _IGNORE
-    )
+    pieces = [f"{_ABBREV[k]}{getattr(args, k)}" for k in _ABBREV if hasattr(args, k)]
+    return "_".join(pieces).replace(".", "p")
 
 
 def add_pretrain_args(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--config", type=str, default="configs/small.json")
     p.add_argument("--tokenizer", type=str, default="models/tokenizer.json")
     p.add_argument("--train-bin", type=str, default="data/train.bin")
     p.add_argument("--output-dir", type=str, default="checkpoints/")
     p.add_argument("--batch-size", type=int, default=64)
-
+    # learning schedule
     p.add_argument("--lr", type=float, default=5e-4)
     p.add_argument("--min-lr-ratio", type=float, default=0.1)
     p.add_argument("--lr-schedule", type=str, default="cosine", choices=sorted(LR_SCHEDULES))
@@ -119,6 +116,25 @@ def add_pretrain_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--run-name", type=str, default=None)
     p.add_argument("--eval", type=str, default="none", choices=("none", "fast", "full"),
                    help="run zero-shot eval on the final checkpoint (both backends) before finishing wandb")
+    # architecture
+    p.add_argument("--vocab-size", type=int, default=8192)
+    p.add_argument("--hidden-size", type=int, default=384)
+    p.add_argument("--num-hidden-layers", type=int, default=12)
+    p.add_argument("--num-attention-heads", type=int, default=6)
+    p.add_argument("--intermediate-size", type=int, default=1024)
+    p.add_argument("--dropout", type=float, default=0.1)
+    p.add_argument("--attn-dropout", type=float, default=0.1)
+    # positional embeddings
+    p.add_argument("--pos-emb", type=str, default="rope", choices=["rope", "absolute", "none"])
+    p.add_argument("--max-position-embeddings", type=int, default=512)
+    # rope
+    p.add_argument("--rope-base", type=float, default=10000.0)
+    p.add_argument("--rope-partial-factor", type=float, default=1.0)
+    # mlp / init
+    p.add_argument("--mlp-type", type=str, default="gelu", choices=["gelu", "swiglu"])
+    p.add_argument("--init-scheme", type=str, default="small",
+                   choices=["small", "gpt2", "xavier", "kaiming"],
+                   help="small=N(0,0.02); gpt2=small + 1/sqrt(2N) residual scaling; xavier/kaiming applied to Linear only")
 
 
 def _build_fast_tokenizer(tokenizer_path: str) -> PreTrainedTokenizerFast:
@@ -153,10 +169,9 @@ def run_pretrain(args: argparse.Namespace) -> None:
     torch.manual_seed(args.seed)
     rng = random.Random(args.seed)
 
-    cfg = GPTBertConfig.from_json_file(args.config)
-    # Expose both backends to eval pipelines that load via AutoModelForCausalLM
-    # or AutoModelForMaskedLM. By default save_pretrained only records the class
-    # used to save, so MLM-backend eval would fail otherwise.
+    cfg = GPTBertConfig(**vars(args))
+
+    # Expose both backends for AutoModel compatibility
     cfg.auto_map = {
         "AutoConfig": "modeling_gptbert.GPTBertConfig",
         "AutoModelForCausalLM": "modeling_gptbert.GPTBertForCausalLM",
@@ -164,16 +179,15 @@ def run_pretrain(args: argparse.Namespace) -> None:
     }
 
     tokenizer = _build_fast_tokenizer(args.tokenizer)
-    if len(tokenizer) != cfg.vocab_size:
-        raise ValueError(
-            f"tokenizer vocab ({len(tokenizer)}) != model vocab ({cfg.vocab_size})"
-        )
+    if len(tokenizer) != args.vocab_size:
+        raise ValueError(f"tokenizer vocab ({len(tokenizer)}) != args vocab ({args.vocab_size})")
+
     mask_id = tokenizer.mask_token_id
     if mask_id is None:
         raise ValueError("tokenizer must define a [MASK] token")
 
-    dataset = PackedTokenDataset(args.train_bin, cfg.max_position_embeddings)
-    print(f"chunks: {len(dataset):,} ({len(dataset) * cfg.max_position_embeddings:,} tokens)")
+    dataset = PackedTokenDataset(args.train_bin, args.max_position_embeddings)
+    print(f"chunks: {len(dataset):,} ({len(dataset) * args.max_position_embeddings:,} tokens)")
 
     loader = DataLoader(
         dataset,
@@ -198,7 +212,7 @@ def run_pretrain(args: argparse.Namespace) -> None:
     )
 
     logger = build_logger(args.wandb, args.wandb_project, args.run_name)
-    logger.update_config({**cfg.to_dict(), **vars(args)})
+    logger.update_config({**vars(args), "num_parameters": model.num_parameters()})
     wandb_run_id = getattr(getattr(logger, "run", None), "id", None)
 
     use_amp = device.type == "cuda"
@@ -233,7 +247,7 @@ def run_pretrain(args: argparse.Namespace) -> None:
             if is_causal:
                 input_ids, labels = make_clm_pair(chunks)
             else:
-                input_ids, labels = apply_mlm_mask(chunks, mask_id, cfg.vocab_size, args.mask_prob)
+                input_ids, labels = apply_mlm_mask(chunks, mask_id, args.vocab_size, args.mask_prob)
 
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
                 out = model(input_ids, labels=labels, is_causal=is_causal)
@@ -242,17 +256,22 @@ def run_pretrain(args: argparse.Namespace) -> None:
             accum_loss += out.loss.item() / args.grad_accum
 
         grad_norm = nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        if math.isnan(accum_loss) or math.isnan(float(grad_norm)):
+            print(f"[warn] NaN at step {step}, skipping update")
+            opt.zero_grad(set_to_none=True)
+            continue
         opt.step()
 
         if step % args.log_every == 0:
             elapsed = time.time() - t_start
-            tokens_seen = (step + 1) * args.batch_size * args.grad_accum * cfg.max_position_embeddings
+            tokens_seen = (step + 1) * args.batch_size * args.grad_accum * args.max_position_embeddings
             tag = "clm" if is_causal else "mlm"
             metrics = {
                 f"loss/{tag}": accum_loss,
                 "lr": lr,
                 "grad_norm": float(grad_norm),
                 "tokens_per_sec": tokens_seen / elapsed,
+                "tokens_seen": tokens_seen,
                 "epoch": epoch,
             }
             logger.log(metrics, step=step)

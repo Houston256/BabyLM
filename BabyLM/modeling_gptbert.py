@@ -11,21 +11,25 @@ class RotaryEmbedding(nn.Module):
         self.dim = dim
         self.max_position_embeddings = max_position_embeddings
         self.base = base
+        # persistent=True: these buffers must round-trip through save/load. With
+        # persistent=False they were skipped by safetensors and ended up as raw
+        # uninitialized memory after transformers v5's meta-device from_pretrained.
         inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, dtype=torch.float32, device=device) / self.dim))
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self._set_cos_sin_cache(seq_len=max_position_embeddings, device=self.inv_freq.device, dtype=torch.float32)
+        self.register_buffer("inv_freq", inv_freq, persistent=True)
+        self._set_cos_sin_cache(seq_len=max_position_embeddings, device=self.inv_freq.device)
 
-    def _set_cos_sin_cache(self, seq_len, device, dtype):
+    # Cache is always kept in fp32; downcast happens lazily in forward.
+    def _set_cos_sin_cache(self, seq_len, device):
         self.max_seq_len_cached = seq_len
-        t = torch.arange(self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype)
-        freqs = torch.outer(t, self.inv_freq)
+        t = torch.arange(seq_len, device=device, dtype=torch.float32)
+        freqs = torch.outer(t, self.inv_freq.to(torch.float32))
         emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos_cached", emb.cos()[None, None, :, :].to(dtype), persistent=False)
-        self.register_buffer("sin_cached", emb.sin()[None, None, :, :].to(dtype), persistent=False)
+        self.register_buffer("cos_cached", emb.cos()[None, None, :, :], persistent=True)
+        self.register_buffer("sin_cached", emb.sin()[None, None, :, :], persistent=True)
 
     def forward(self, x, seq_len=None):
         if seq_len > self.max_seq_len_cached:
-            self._set_cos_sin_cache(seq_len=seq_len, device=x.device, dtype=x.dtype)
+            self._set_cos_sin_cache(seq_len=seq_len, device=x.device)
         return (
             self.cos_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
             self.sin_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
@@ -43,34 +47,33 @@ def apply_rotary_pos_emb(q, k, cos, sin):
     return q_embed, k_embed
 
 
+def apply_partial_rotary_pos_emb(q, k, cos, sin, rot_dim: int):
+    # rot_dim is the (even) number of channels rotated; rest pass through.
+    q_rot, q_pass = q[..., :rot_dim], q[..., rot_dim:]
+    k_rot, k_pass = k[..., :rot_dim], k[..., rot_dim:]
+    q_rot = (q_rot * cos) + (rotate_half(q_rot) * sin)
+    k_rot = (k_rot * cos) + (rotate_half(k_rot) * sin)
+    return torch.cat([q_rot, q_pass], dim=-1), torch.cat([k_rot, k_pass], dim=-1)
+
+
 class GPTBertConfig(PretrainedConfig):
     model_type = "gptbert"
 
-    def __init__(
-        self,
-        vocab_size: int = 8192,
-        hidden_size: int = 384,
-        num_hidden_layers: int = 12,
-        num_attention_heads: int = 6,
-        intermediate_size: int = 1024,
-        max_position_embeddings: int = 512,
-        dropout: float = 0.1,
-        use_rope: bool = True,
-        rope_base: float = 10000.0,
-        **kwargs,
-    ):
+    def __init__(self, **kwargs):
         # Tie word embeddings is standard for small models to save parameters
         kwargs.setdefault("tie_word_embeddings", True)
         super().__init__(**kwargs)
-        self.vocab_size = vocab_size
-        self.hidden_size = hidden_size
-        self.num_hidden_layers = num_hidden_layers
-        self.num_attention_heads = num_attention_heads
-        self.intermediate_size = intermediate_size
-        self.max_position_embeddings = max_position_embeddings
-        self.dropout = dropout
-        self.use_rope = use_rope
-        self.rope_base = rope_base
+
+
+class SwiGLU(nn.Module):
+    def __init__(self, hidden_size: int, intermediate_size: int):
+        super().__init__()
+        self.gate = nn.Linear(hidden_size, intermediate_size)
+        self.up = nn.Linear(hidden_size, intermediate_size)
+        self.down = nn.Linear(intermediate_size, hidden_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down(F.silu(self.gate(x)) * self.up(x))
 
 
 class _Block(nn.Module):
@@ -79,17 +82,32 @@ class _Block(nn.Module):
         self.n_heads = cfg.num_attention_heads
         self.head_dim = cfg.hidden_size // cfg.num_attention_heads
         self.dropout_p = cfg.dropout
+        # attn_dropout is the SDPA dropout; cfg.dropout is for residual/embedding path.
+        self.attn_dropout_p = cfg.attn_dropout if cfg.attn_dropout is not None else cfg.dropout
+
+        # Partial-rotary: only rotate the first rot_dim channels of each head.
+        # cos/sin tensors are sized to rot_dim by the parent module's RotaryEmbedding,
+        # so just slice q/k to match.
+        partial_factor = getattr(cfg, "rope_partial_factor", 1.0)
+        rot_dim = int(self.head_dim * partial_factor)
+        self.rot_dim = rot_dim - (rot_dim % 2)  # must be even
 
         self.norm1 = nn.LayerNorm(cfg.hidden_size)
         self.qkv = nn.Linear(cfg.hidden_size, 3 * cfg.hidden_size)
         self.proj = nn.Linear(cfg.hidden_size, cfg.hidden_size)
 
         self.norm2 = nn.LayerNorm(cfg.hidden_size)
-        self.mlp = nn.Sequential(
-            nn.Linear(cfg.hidden_size, cfg.intermediate_size),
-            nn.GELU(),
-            nn.Linear(cfg.intermediate_size, cfg.hidden_size),
-        )
+        mlp_type = getattr(cfg, "mlp_type", "gelu")
+        if mlp_type == "swiglu":
+            self.mlp = SwiGLU(cfg.hidden_size, cfg.intermediate_size)
+        elif mlp_type == "gelu":
+            self.mlp = nn.Sequential(
+                nn.Linear(cfg.hidden_size, cfg.intermediate_size),
+                nn.GELU(),
+                nn.Linear(cfg.intermediate_size, cfg.hidden_size),
+            )
+        else:
+            raise ValueError(f"unknown mlp_type: {mlp_type}")
 
     def forward(self, x: torch.Tensor, attn_mask: torch.Tensor | None = None, is_causal: bool = False, rotary_emb_vals: tuple[torch.Tensor, torch.Tensor] | None = None) -> torch.Tensor:
         # x: (batch, seq, hidden)
@@ -104,22 +122,26 @@ class _Block(nn.Module):
         # SDPA expects (B, H, T, D)
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
 
-        # Apply RoPE if provided
+        # Apply RoPE if provided. cos/sin are sized to self.rot_dim by the parent module.
         if rotary_emb_vals is not None:
             cos, sin = rotary_emb_vals
-            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+            if self.rot_dim == self.head_dim:
+                q, k = apply_rotary_pos_emb(q, k, cos, sin)
+            else:
+                q, k = apply_partial_rotary_pos_emb(q, k, cos, sin, self.rot_dim)
 
         # 3. Compute Attention. When attn_mask is None and is_causal=True, SDPA
         # dispatches to the FlashAttention kernel; passing a materialized mask forces math kernel.
-        p = self.dropout_p if self.training else 0.0
-        attn = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=p, is_causal=is_causal)
+        p_res = self.dropout_p if self.training else 0.0
+        p_attn = self.attn_dropout_p if self.training else 0.0
+        attn = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=p_attn, is_causal=is_causal)
 
         # 4. Reshape back to (B, T, C)
         attn = attn.transpose(1, 2).reshape(B, T, C)
 
         # 5. Residual connections and MLP
-        x = x + F.dropout(self.proj(attn), p=p, training=self.training)
-        x = x + F.dropout(self.mlp(self.norm2(x)), p=p, training=self.training)
+        x = x + F.dropout(self.proj(attn), p=p_res, training=self.training)
+        x = x + F.dropout(self.mlp(self.norm2(x)), p=p_res, training=self.training)
         return x
 
 
@@ -132,15 +154,20 @@ class _GPTBertBase(PreTrainedModel):
 
     def __init__(self, config: GPTBertConfig):
         super().__init__(config)
+        self.pos_strategy = config.pos_emb
+
         self.tok_emb = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.pos_emb = nn.Embedding(config.max_position_embeddings, config.hidden_size)
         self.drop = nn.Dropout(config.dropout)
 
-        self.use_rope = getattr(config, "use_rope", True)
-        if self.use_rope:
+        if self.pos_strategy == "absolute":
+            self.abs_pos_emb = nn.Embedding(config.max_position_embeddings, config.hidden_size)
+        elif self.pos_strategy == "rope":
             head_dim = config.hidden_size // config.num_attention_heads
+            partial_factor = getattr(config, "rope_partial_factor", 1.0)
+            rot_dim = int(head_dim * partial_factor)
+            rot_dim -= rot_dim % 2  # must be even for the half-split rotation
             self.rotary_emb = RotaryEmbedding(
-                head_dim,
+                rot_dim,
                 max_position_embeddings=config.max_position_embeddings,
                 base=getattr(config, "rope_base", 10000.0)
             )
@@ -150,10 +177,30 @@ class _GPTBertBase(PreTrainedModel):
         self.head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.post_init()
 
+        # gpt2 scheme also scales residual-stream output projections by 1/sqrt(2N)
+        # so residual variance stays bounded with depth. Runs after post_init so it
+        # multiplies the freshly initialized weights; from_pretrained then overwrites.
+        if getattr(config, "init_scheme", "small") == "gpt2":
+            scale = (2 * config.num_hidden_layers) ** -0.5
+            for block in self.blocks:
+                block.proj.weight.data.mul_(scale)
+                mlp_out = block.mlp.down if isinstance(block.mlp, SwiGLU) else block.mlp[2]
+                mlp_out.weight.data.mul_(scale)
+
     def _init_weights(self, module: nn.Module) -> None:
-        if isinstance(module, (nn.Linear, nn.Embedding)):
+        scheme = getattr(self.config, "init_scheme", "small")
+        if isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, std=0.02)
-            if hasattr(module, "bias") and module.bias is not None:
+        elif isinstance(module, nn.Linear):
+            if scheme in ("small", "gpt2"):
+                nn.init.normal_(module.weight, std=0.02)
+            elif scheme == "xavier":
+                nn.init.xavier_normal_(module.weight)
+            elif scheme == "kaiming":
+                nn.init.kaiming_normal_(module.weight, nonlinearity="relu")
+            else:
+                raise ValueError(f"unknown init_scheme: {scheme}")
+            if module.bias is not None:
                 nn.init.zeros_(module.bias)
 
     # These two are required for HF's tie_weights() to actually tie head <-> tok_emb
@@ -171,16 +218,15 @@ class _GPTBertBase(PreTrainedModel):
 
     def _backbone(self, input_ids: torch.Tensor, attention_mask: torch.Tensor | None, is_causal: bool) -> torch.Tensor:
         B, T = input_ids.shape
-        pos = torch.arange(T, device=input_ids.device)
 
         x = self.tok_emb(input_ids)
-        if not self.use_rope:
-            x = x + self.pos_emb(pos)
-        x = self.drop(x)
-
         rotary_emb_vals = None
-        if self.use_rope:
+        if self.pos_strategy == "rope":
             rotary_emb_vals = self.rotary_emb(x, seq_len=T)
+        elif self.pos_strategy == "absolute":
+            pos = torch.arange(T, device=input_ids.device)
+            x = x + self.abs_pos_emb(pos)
+        x = self.drop(x)
 
         # --- MASK LOGIC ---
         # Fast path: pure causal with no padding -> hand off to SDPA's `is_causal=True`,

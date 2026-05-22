@@ -64,13 +64,16 @@ uv run python main.py train-tokenizer --vocab-size 8192
 uv run python main.py tokenize-corpus --tokenizer models/tokenizer.json --output data/train.bin
 
 # 4. Pretrain + inline eval (logs eval metrics to the live wandb run before finishing).
-# MLM pseudo-likelihood scoring often beats causal on BLiMP for hybrid models, so
-# train.py runs both backends when --eval is not 'none'.
+# All arch/training hyperparams default to the values in add_pretrain_args().
+# Override any subset via ARGS:
+#   qsub -v ARGS="--run-name foo --pos-emb rope --rope-base 1000" scripts/submit_babylm.sh
+ARGS=${ARGS:-}
+
+# shellcheck disable=SC2086  # intentional word splitting on ARGS
 uv run python main.py pretrain \
-    --config configs/a40.json \
     --output-dir checkpoints/ \
     --wandb \
-    --max-epochs 10 \
-    --eval fast
+    --eval fast \
+    $ARGS
 
 echo "All steps completed successfully at $(date)"

@@ -1,9 +1,0 @@
-{
-    "vocab_size": 8192,
-    "hidden_size": 128,
-    "num_hidden_layers": 6,
-    "num_attention_heads": 4,
-    "intermediate_size": 512,
-    "max_position_embeddings": 256,
-    "dropout": 0.1
-}

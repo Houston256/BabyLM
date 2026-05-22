@@ -22,6 +22,10 @@ def main():
     p_corp.add_argument("--dataset", type=str, default="BabyLM-community/BabyLM-2026-Strict-Small")
     p_corp.add_argument("--split", type=str, default="train")
     p_corp.add_argument("--text-column", type=str, default="text")
+    p_corp.add_argument("--strip-speaker-tags", action="store_true",
+                        help="remove CHILDES-style `*SPEAKER:\\t` prefix from each utterance")
+    p_corp.add_argument("--insert-sep", action="store_true",
+                        help="append [SEP] token between documents (utterance boundaries)")
 
     p_pre = subparsers.add_parser("pretrain", help="Pretrain GPT-BERT v0")
     add_pretrain_args(p_pre)
@@ -44,6 +48,8 @@ def main():
             dataset_name=args.dataset,
             split=args.split,
             text_column=args.text_column,
+            strip_speaker_tags=args.strip_speaker_tags,
+            insert_sep=args.insert_sep,
         )
 
     elif args.command == "pretrain":

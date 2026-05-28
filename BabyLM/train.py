@@ -232,7 +232,6 @@ def run_pretrain(args: argparse.Namespace) -> None:
 
     opts = []
     if args.optimizer == "muon":
-        from BabyLM.muon import Muon
         muon_params, adamw_decay, adamw_no_decay = [], [], []
         for name, p in model.named_parameters():
             if not p.requires_grad: continue
@@ -242,8 +241,8 @@ def run_pretrain(args: argparse.Namespace) -> None:
                 adamw_no_decay.append(p)
             else:
                 adamw_decay.append(p)
-        
-        opts.append(Muon(muon_params, lr=args.muon_lr, momentum=0.95))
+
+        opts.append(torch.optim.Muon(muon_params, lr=args.muon_lr, momentum=0.95))
         opts.append(torch.optim.AdamW([
             {"params": adamw_decay, "weight_decay": args.weight_decay},
             {"params": adamw_no_decay, "weight_decay": 0.0}
@@ -282,7 +281,7 @@ def run_pretrain(args: argparse.Namespace) -> None:
         lr_mult = schedule_fn(step, max_steps, args.warmup_steps, 1.0, args.min_lr_ratio)
 
         for opt in opts:
-            base_lr = args.muon_lr if opt.__class__.__name__ == "Muon" else args.lr
+            base_lr = args.muon_lr if isinstance(opt, torch.optim.Muon) else args.lr
             for g in opt.param_groups:
                 g["lr"] = base_lr * lr_mult
             opt.zero_grad(set_to_none=True)

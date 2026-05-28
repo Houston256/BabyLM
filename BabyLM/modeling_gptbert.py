@@ -264,6 +264,7 @@ class GPTBertForCausalLM(_GPTBertBase):
                     shift_logits.flatten(0, 1),
                     shift_labels.flatten(),
                     ignore_index=-100,
+                    label_smoothing=getattr(self.config, "label_smoothing", 0.0)
                 )
             else:
                 # MLM: predict at masked positions (labels are -100 elsewhere), no shift
@@ -271,6 +272,7 @@ class GPTBertForCausalLM(_GPTBertBase):
                     logits.flatten(0, 1),
                     labels.flatten(),
                     ignore_index=-100,
+                    label_smoothing=getattr(self.config, "label_smoothing", 0.0)
                 )
         cls = CausalLMOutput if is_causal else MaskedLMOutput
         return cls(loss=loss, logits=logits)
@@ -281,7 +283,12 @@ class GPTBertForMaskedLM(_GPTBertBase):
         loss = None
         if labels is not None:
             # MLM objective (predict the [MASK] tokens). Labels are -100 for non-masked positions.
-            loss = F.cross_entropy(logits.flatten(0, 1), labels.flatten(), ignore_index=-100)
+            loss = F.cross_entropy(
+                logits.flatten(0, 1), 
+                labels.flatten(), 
+                ignore_index=-100, 
+                label_smoothing=getattr(self.config, "label_smoothing", 0.0)
+            )
         return MaskedLMOutput(loss=loss, logits=logits)
 
 

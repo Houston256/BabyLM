@@ -11,7 +11,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from transformers import PreTrainedTokenizerFast
 
-from BabyLM.dataset import PackedTokenDataset, apply_mlm_mask, apply_mntp_mask, make_clm_pair
+from BabyLM.dataset import BPEDropoutDataset, PackedTokenDataset, apply_mlm_mask, apply_mntp_mask, make_clm_pair
 from BabyLM.eval_report import model_results_dir, parse_eval_results
 from BabyLM.logger import build_logger
 from BabyLM.modeling_gptbert import GPTBertConfig, GPTBertForCausalLM
@@ -46,6 +46,8 @@ LR_SCHEDULES = {
 
 def infinite(loader: DataLoader):
     while True:
+        if hasattr(loader.dataset, "refresh"):
+            loader.dataset.refresh()
         yield from loader
 
 
@@ -102,10 +104,16 @@ def add_pretrain_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--lr-schedule", type=str, default="cosine", choices=sorted(LR_SCHEDULES))
     p.add_argument("--warmup-steps", type=int, default=300)
 
+    p.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "muon"], help="Optimizer to use")
+    p.add_argument("--muon-lr", type=float, default=0.02, help="Base learning rate for Muon optimizer")
+    p.add_argument("--label-smoothing", type=float, default=0.0, help="Label smoothing for cross entropy")
     p.add_argument("--weight-decay", type=float, default=0.1)
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--grad-accum", type=int, default=1)
     p.add_argument("--mask-prob", type=float, default=0.15)
+    p.add_argument("--span-masking", action="store_true", help="Enable Span Masking for MLM/MNTP")
+    p.add_argument("--bpe-dropout", type=float, default=0.0, help="Enable BPE Dropout (requires dynamic tokenization from raw text)")
+    p.add_argument("--train-raw-dir", type=str, default="data/raw", help="Path to raw txt files (required if --bpe-dropout > 0)")
     # Default mix matches the GPT-BERT "causal-focus" baseline: ~6.25% MLM, 93.75% CLM.
     p.add_argument("--hybrid-numerator", type=int, default=1)
     p.add_argument("--hybrid-denominator", type=int, default=16)
@@ -192,7 +200,18 @@ def run_pretrain(args: argparse.Namespace) -> None:
     if mask_id is None:
         raise ValueError("tokenizer must define a [MASK] token")
 
-    dataset = PackedTokenDataset(args.train_bin, args.max_position_embeddings)
+    if args.bpe_dropout > 0:
+        print(f"Using dynamic BPEDropoutDataset (dropout={args.bpe_dropout})")
+        dataset = BPEDropoutDataset(
+            dataset_name="BabyLM-community/BabyLM-2026-Strict-Small", 
+            split="train", 
+            tokenizer_path=args.tokenizer, 
+            seq_length=args.max_position_embeddings, 
+            bpe_dropout=args.bpe_dropout
+        )
+    else:
+        dataset = PackedTokenDataset(args.train_bin, args.max_position_embeddings)
+    
     print(f"chunks: {len(dataset):,} ({len(dataset) * args.max_position_embeddings:,} tokens)")
 
     loader = DataLoader(
@@ -202,7 +221,7 @@ def run_pretrain(args: argparse.Namespace) -> None:
         drop_last=True,
         num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
-        persistent_workers=args.num_workers > 0,
+        persistent_workers=(args.num_workers > 0 and args.bpe_dropout == 0.0),
     )
     batches = infinite(loader)
 
@@ -211,11 +230,30 @@ def run_pretrain(args: argparse.Namespace) -> None:
     assert model.head.weight.data_ptr() == model.tok_emb.weight.data_ptr(), \
         "tok_emb / head weights are not tied"
 
-    opt = torch.optim.AdamW(
-        build_param_groups(model, args.weight_decay),
-        lr=args.lr,
-        betas=(0.9, 0.98),
-    )
+    opts = []
+    if args.optimizer == "muon":
+        from BabyLM.muon import Muon
+        muon_params, adamw_decay, adamw_no_decay = [], [], []
+        for name, p in model.named_parameters():
+            if not p.requires_grad: continue
+            if p.ndim >= 2 and "tok_emb" not in name and "abs_pos_emb" not in name and "head" not in name:
+                muon_params.append(p)
+            elif p.ndim < 2 or name.endswith(".bias"):
+                adamw_no_decay.append(p)
+            else:
+                adamw_decay.append(p)
+        
+        opts.append(Muon(muon_params, lr=args.muon_lr, momentum=0.95))
+        opts.append(torch.optim.AdamW([
+            {"params": adamw_decay, "weight_decay": args.weight_decay},
+            {"params": adamw_no_decay, "weight_decay": 0.0}
+        ], lr=args.lr, betas=(0.9, 0.95)))
+    else:
+        opts.append(torch.optim.AdamW(
+            build_param_groups(model, args.weight_decay),
+            lr=args.lr,
+            betas=(0.9, 0.98),
+        ))
 
     logger = build_logger(args.wandb, args.wandb_project, args.run_name)
     logger.update_config({**vars(args), "num_parameters": model.num_parameters()})
@@ -241,21 +279,23 @@ def run_pretrain(args: argparse.Namespace) -> None:
         is_causal = rng.random() >= mlm_p
         epoch = step // steps_per_epoch if steps_per_epoch > 0 else 0
 
-        lr = schedule_fn(step, max_steps, args.warmup_steps, args.lr, min_lr)
+        lr_mult = schedule_fn(step, max_steps, args.warmup_steps, 1.0, args.min_lr_ratio)
 
-        for g in opt.param_groups:
-            g["lr"] = lr
+        for opt in opts:
+            base_lr = args.muon_lr if opt.__class__.__name__ == "Muon" else args.lr
+            for g in opt.param_groups:
+                g["lr"] = base_lr * lr_mult
+            opt.zero_grad(set_to_none=True)
 
-        opt.zero_grad(set_to_none=True)
         accum_loss = 0.0
         for _ in range(args.grad_accum):
             chunks = next(batches).to(device, non_blocking=True)
             if is_causal:
                 input_ids, labels = make_clm_pair(chunks)
             elif args.mlm_style == "mntp":
-                input_ids, labels = apply_mntp_mask(chunks, mask_id, args.vocab_size, args.mask_prob)
+                input_ids, labels = apply_mntp_mask(chunks, mask_id, args.vocab_size, args.mask_prob, args.span_masking)
             else:
-                input_ids, labels = apply_mlm_mask(chunks, mask_id, args.vocab_size, args.mask_prob)
+                input_ids, labels = apply_mlm_mask(chunks, mask_id, args.vocab_size, args.mask_prob, args.span_masking)
 
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
                 out = model(input_ids, labels=labels, is_causal=is_causal)
@@ -266,17 +306,18 @@ def run_pretrain(args: argparse.Namespace) -> None:
         grad_norm = nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         if math.isnan(accum_loss) or math.isnan(float(grad_norm)):
             print(f"[warn] NaN at step {step}, skipping update")
-            opt.zero_grad(set_to_none=True)
+            for opt in opts: opt.zero_grad(set_to_none=True)
             continue
-        opt.step()
+        for opt in opts: opt.step()
 
         if step % args.log_every == 0:
             elapsed = time.time() - t_start
             tokens_seen = (step + 1) * args.batch_size * args.grad_accum * args.max_position_embeddings
             tag = "clm" if is_causal else "mlm"
+            reported_lr = opts[-1].param_groups[0]["lr"]
             metrics = {
                 f"loss/{tag}": accum_loss,
-                "lr": lr,
+                "lr": reported_lr,
                 "grad_norm": float(grad_norm),
                 "tokens_per_sec": tokens_seen / elapsed,
                 "tokens_seen": tokens_seen,
@@ -284,7 +325,7 @@ def run_pretrain(args: argparse.Namespace) -> None:
             }
             logger.log(metrics, step=step)
             print(
-                f"step {step:6d} | epoch {epoch} | {tag} | loss {accum_loss:.4f} | lr {lr:.2e} | {metrics['tokens_per_sec']:,.0f} tok/s")
+                f"step {step:6d} | epoch {epoch} | {tag} | loss {accum_loss:.4f} | lr {reported_lr:.2e} | {metrics['tokens_per_sec']:,.0f} tok/s")
 
         if step > 0 and step % args.save_every == 0:
             _save_checkpoint(model, tokenizer, output_dir, wandb_run_id)

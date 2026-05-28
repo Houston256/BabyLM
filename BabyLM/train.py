@@ -1,6 +1,7 @@
 import argparse
 import math
 import random
+import secrets
 import subprocess
 import time
 from pathlib import Path
@@ -10,12 +11,12 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from transformers import PreTrainedTokenizerFast
 
-from BabyLM.dataset import PackedTokenDataset, apply_mlm_mask, make_clm_pair
+from BabyLM.dataset import PackedTokenDataset, apply_mlm_mask, apply_mntp_mask, make_clm_pair
 from BabyLM.eval_report import model_results_dir, parse_eval_results
 from BabyLM.logger import build_logger
 from BabyLM.modeling_gptbert import GPTBertConfig, GPTBertForCausalLM
 
-EVAL_BACKENDS = ("causal", "mlm")
+EVAL_BACKENDS = ("causal", "mlm", "mntp")
 
 
 def get_device() -> torch.device:
@@ -80,12 +81,14 @@ _ABBREV = {
     "pos_emb": "pos_emb", "rope_base": "rb",
     "rope_partial_factor": "rp", "attn_dropout": "ad",
     "mlp_type": "mlp", "init_scheme": "init",
+    "mlm_style": "mlms",
 }
 
 
 def _run_name(args: argparse.Namespace) -> str:
     pieces = [f"{_ABBREV[k]}{getattr(args, k)}" for k in _ABBREV if hasattr(args, k)]
-    return "_".join(pieces).replace(".", "p")
+    base = "_".join(pieces).replace(".", "p")
+    return f"{base}__{secrets.token_hex(4)}"
 
 
 def add_pretrain_args(p: argparse.ArgumentParser) -> None:
@@ -135,6 +138,9 @@ def add_pretrain_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--init-scheme", type=str, default="small",
                    choices=["small", "gpt2", "xavier", "kaiming"],
                    help="small=N(0,0.02); gpt2=small + 1/sqrt(2N) residual scaling; xavier/kaiming applied to Linear only")
+    p.add_argument("--mlm-style", type=str, default="mlm", choices=["mlm", "mntp"],
+                   help="mlm=predict masked tokens at their own position (standard BERT); "
+                        "mntp=predict at position k-1 (GPT-BERT — same alignment as CLM, lets one head serve both)")
 
 
 def _build_fast_tokenizer(tokenizer_path: str) -> PreTrainedTokenizerFast:
@@ -246,6 +252,8 @@ def run_pretrain(args: argparse.Namespace) -> None:
             chunks = next(batches).to(device, non_blocking=True)
             if is_causal:
                 input_ids, labels = make_clm_pair(chunks)
+            elif args.mlm_style == "mntp":
+                input_ids, labels = apply_mntp_mask(chunks, mask_id, args.vocab_size, args.mask_prob)
             else:
                 input_ids, labels = apply_mlm_mask(chunks, mask_id, args.vocab_size, args.mask_prob)
 

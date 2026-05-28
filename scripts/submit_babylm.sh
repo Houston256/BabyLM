@@ -60,13 +60,32 @@ uv sync --link-mode=copy
 # --- Execution ---
 
 # 3. Tokenize
+# DATA_ARGS controls corpus preprocessing. Three useful modes:
+#   raw (current default): -v DATA_ARGS=""           (no preprocessing, HF flat dataset)
+#   strip+utterance SEP:   -v DATA_ARGS="--strip-speaker-tags --insert-sep"
+#   conversation SEP:      -v DATA_ARGS="--source-mode raw --raw-dir data/raw"
+# The bin is rebuilt in-scratch every job, so DATA_ARGS is what trains.
+DATA_ARGS=${DATA_ARGS:-}
+
+# Always pull the raw per-source txt files (55 MB total) so --source-mode raw works.
+mkdir -p data/raw
+for src in childes simple_wiki gutenberg open_subtitles bnc_spoken switchboard; do
+    if [ ! -f "data/raw/${src}.train.txt" ]; then
+        curl -sL "https://huggingface.co/datasets/BabyLM-community/BabyLM-2026-Strict-Small/resolve/main/${src}.train.txt" \
+            -o "data/raw/${src}.train.txt"
+    fi
+done
+
 uv run python main.py train-tokenizer --vocab-size 8192
-uv run python main.py tokenize-corpus --tokenizer models/tokenizer.json --output data/train.bin
+# shellcheck disable=SC2086  # intentional word splitting on DATA_ARGS
+uv run python main.py tokenize-corpus --tokenizer models/tokenizer.json --output data/train.bin $DATA_ARGS
 
 # 4. Pretrain + inline eval (logs eval metrics to the live wandb run before finishing).
 # All arch/training hyperparams default to the values in add_pretrain_args().
 # Override any subset via ARGS:
 #   qsub -v ARGS="--run-name foo --pos-emb rope --rope-base 1000" scripts/submit_babylm.sh
+# To ablate preprocessing (e.g. the old raw bin), also pass:
+#   -v DATA_ARGS=""
 ARGS=${ARGS:-}
 
 # shellcheck disable=SC2086  # intentional word splitting on ARGS

@@ -138,7 +138,7 @@ def add_pretrain_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--init-scheme", type=str, default="small",
                    choices=["small", "gpt2", "xavier", "kaiming"],
                    help="small=N(0,0.02); gpt2=small + 1/sqrt(2N) residual scaling; xavier/kaiming applied to Linear only")
-    p.add_argument("--mlm-style", type=str, default="mlm", choices=["mlm", "mntp"],
+    p.add_argument("--mlm-style", type=str, default="mntp", choices=["mlm", "mntp"],
                    help="mlm=predict masked tokens at their own position (standard BERT); "
                         "mntp=predict at position k-1 (GPT-BERT — same alignment as CLM, lets one head serve both)")
 

@@ -1,5 +1,6 @@
 import re
 from pathlib import Path
+from typing import Iterator
 
 import numpy as np
 from datasets import load_dataset
@@ -8,6 +9,106 @@ from tqdm import tqdm
 
 # Matches CHILDES-style speaker tags at the start of an utterance: *CHI:\t, *MOT:, etc.
 _SPEAKER_TAG = re.compile(r"^\*[A-Z]+:\s*")
+# Document boundary marker used in childes, simple_wiki, gutenberg raw files.
+_DOC_HEADER = re.compile(r"^= = =.*= = =\s*$")
+
+
+def _iter_docs_with_headers(path: Path, strip_speaker_tags: bool) -> Iterator[str]:
+    """Yield one document per `= = = ... = = =` header block (childes / wiki / gutenberg).
+
+    For childes the header marks .cha file boundaries (conversations).
+    Lines starting with `[` (action annotations) or `%` (CHAT metadata) are dropped.
+    Speaker tags `*XXX:\\t` are kept by default — they signal turn changes.
+    """
+    buf: list[str] = []
+    with path.open() as f:
+        for raw in f:
+            line = raw.rstrip("\n")
+            if _DOC_HEADER.match(line):
+                if buf:
+                    yield " ".join(buf)
+                buf = []
+                continue
+            if not line or line.startswith("[") or line.startswith("%"):
+                continue
+            if strip_speaker_tags:
+                line = _SPEAKER_TAG.sub("", line)
+                if not line:
+                    continue
+            buf.append(line)
+    if buf:
+        yield " ".join(buf)
+
+
+def _iter_docs_flat(path: Path) -> Iterator[str]:
+    """No document structure available — yield the whole file as one document.
+
+    Used for open_subtitles, bnc_spoken, switchboard — sources where the original
+    document boundaries weren't preserved during preprocessing.
+    """
+    with path.open() as f:
+        chunk = " ".join(line.strip() for line in f if line.strip())
+    if chunk:
+        yield chunk
+
+
+# Per-source parser dispatch. Keys are filename stems under raw_dir.
+_RAW_SOURCES: dict[str, str] = {
+    "childes":        "headers",
+    "simple_wiki":    "headers",
+    "gutenberg":      "headers",
+    "open_subtitles": "flat",
+    "bnc_spoken":     "flat",
+    "switchboard":    "flat",
+}
+
+
+def tokenize_from_raw(
+    tokenizer_path: str | Path,
+    output_path: str | Path,
+    raw_dir: str | Path,
+    strip_speaker_tags: bool = False,
+) -> None:
+    """Tokenize from the raw per-source txt files, preserving document granularity.
+
+    Inserts [SEP] only at document boundaries (conversations / articles / books),
+    not between utterances within a document. This gives the model a sparse,
+    meaningful boundary signal instead of one SEP every ~10 tokens.
+    """
+    tokenizer = Tokenizer.from_file(str(tokenizer_path))
+    if tokenizer.get_vocab_size() > 65535:
+        raise ValueError("vocab too large for uint16 storage")
+    sep_id = tokenizer.token_to_id("[SEP]")
+    if sep_id is None:
+        raise ValueError("tokenizer has no [SEP] token; raw mode always inserts SEP between docs")
+
+    raw_dir = Path(raw_dir)
+    tokens: list[int] = []
+    n_docs_total = 0
+    for stem, mode in _RAW_SOURCES.items():
+        path = raw_dir / f"{stem}.train.txt"
+        if not path.exists():
+            raise FileNotFoundError(f"missing raw source: {path}")
+        iterator = (
+            _iter_docs_with_headers(path, strip_speaker_tags) if mode == "headers"
+            else _iter_docs_flat(path)
+        )
+        n_docs = 0
+        n_tokens_before = len(tokens)
+        for doc in tqdm(iterator, desc=f"  {stem}"):
+            tokens.extend(tokenizer.encode(doc).ids)
+            tokens.append(sep_id)
+            n_docs += 1
+        n_docs_total += n_docs
+        added = len(tokens) - n_tokens_before
+        print(f"  {stem:16s}  mode={mode:7s}  docs={n_docs:>7,}  tokens={added:>11,}")
+
+    arr = np.array(tokens, dtype=np.uint16)
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    arr.tofile(output_path)
+    print(f"\nwrote {len(arr):,} tokens to {output_path}")
+    print(f"inserted [SEP] (id={sep_id}) between {n_docs_total:,} documents")
 
 
 def tokenize_corpus(

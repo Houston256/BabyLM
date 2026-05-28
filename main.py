@@ -3,7 +3,7 @@ import sys
 
 from BabyLM.tokenizer.bpe_tokenizer import BabyLMTokenizer
 from BabyLM.tokenizer.visualize_trained_tokenizer import export_html_visualization
-from BabyLM.data_handler.tokenize_corpus import tokenize_corpus
+from BabyLM.data_handler.tokenize_corpus import tokenize_corpus, tokenize_from_raw
 from BabyLM.train import add_pretrain_args, run_pretrain
 
 
@@ -26,6 +26,12 @@ def main():
                         help="remove CHILDES-style `*SPEAKER:\\t` prefix from each utterance")
     p_corp.add_argument("--insert-sep", action="store_true",
                         help="append [SEP] token between documents (utterance boundaries)")
+    p_corp.add_argument("--source-mode", choices=["hf", "raw"], default="hf",
+                        help="hf: load flattened HF dataset (one utterance per row); "
+                             "raw: parse per-source txt files in --raw-dir, grouping utterances "
+                             "into conversations/articles and inserting [SEP] only at those boundaries")
+    p_corp.add_argument("--raw-dir", type=str, default="data/raw",
+                        help="directory containing {childes,simple_wiki,gutenberg,open_subtitles,bnc_spoken,switchboard}.train.txt")
 
     p_pre = subparsers.add_parser("pretrain", help="Pretrain GPT-BERT v0")
     add_pretrain_args(p_pre)
@@ -42,15 +48,23 @@ def main():
             )
 
     elif args.command == "tokenize-corpus":
-        tokenize_corpus(
-            tokenizer_path=args.tokenizer,
-            output_path=args.output,
-            dataset_name=args.dataset,
-            split=args.split,
-            text_column=args.text_column,
-            strip_speaker_tags=args.strip_speaker_tags,
-            insert_sep=args.insert_sep,
-        )
+        if args.source_mode == "raw":
+            tokenize_from_raw(
+                tokenizer_path=args.tokenizer,
+                output_path=args.output,
+                raw_dir=args.raw_dir,
+                strip_speaker_tags=args.strip_speaker_tags,
+            )
+        else:
+            tokenize_corpus(
+                tokenizer_path=args.tokenizer,
+                output_path=args.output,
+                dataset_name=args.dataset,
+                split=args.split,
+                text_column=args.text_column,
+                strip_speaker_tags=args.strip_speaker_tags,
+                insert_sep=args.insert_sep,
+            )
 
     elif args.command == "pretrain":
         run_pretrain(args)

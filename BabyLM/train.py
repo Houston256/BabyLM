@@ -19,8 +19,6 @@ from BabyLM.logger import build_logger
 from BabyLM.modeling_gptbert import GPTBertConfig, GPTBertForCausalLM
 from BabyLM.optim.lamb import Lamb
 
-EVAL_BACKENDS = ("causal", "mlm", "mntp")
-
 
 def get_device() -> torch.device:
     if torch.cuda.is_available():
@@ -541,15 +539,16 @@ def run_pretrain(args: argparse.Namespace) -> None:
     print(f"saved {output_dir}")
 
     if args.eval != "none":
-        _run_eval_and_log(args.eval, output_dir, logger, step=max_steps)
+        # eval the CLM half + whichever masked objective we trained
+        _run_eval_and_log(args.eval, output_dir, logger, step=max_steps, backends=("causal", args.mlm_style))
 
     logger.finish()
 
 
-def _run_eval_and_log(mode: str, ckpt_dir: Path, logger, step: int) -> None:
+def _run_eval_and_log(mode: str, ckpt_dir: Path, logger, step: int, backends: tuple[str, ...]) -> None:
     repo_root = Path(__file__).resolve().parents[1]
     eval_sh = repo_root / "scripts" / "eval.sh"
-    for backend in EVAL_BACKENDS:
+    for backend in backends:
         print(f"[eval] running {mode} {backend}")
         rc = subprocess.run([str(eval_sh), str(ckpt_dir), mode, backend]).returncode
         if rc != 0:

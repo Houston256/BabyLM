@@ -15,6 +15,7 @@ from BabyLM.dataset import BPEDropoutDataset, PackedTokenDataset, apply_mlm_mask
 from BabyLM.eval_report import model_results_dir, parse_eval_results
 from BabyLM.logger import build_logger
 from BabyLM.modeling_gptbert import GPTBertConfig, GPTBertForCausalLM
+from BabyLM.optim.lamb import Lamb
 
 EVAL_BACKENDS = ("causal", "mlm", "mntp")
 
@@ -104,8 +105,13 @@ def add_pretrain_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--lr-schedule", type=str, default="cosine", choices=sorted(LR_SCHEDULES))
     p.add_argument("--warmup-steps", type=int, default=300)
 
-    p.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "muon"], help="Optimizer to use")
+    p.add_argument("--optimizer", type=str, default="lamb", choices=["adamw", "muon", "lamb"], help="Optimizer to use")
     p.add_argument("--muon-lr", type=float, default=0.02, help="Base learning rate for Muon optimizer")
+    p.add_argument("--optimizer-eps", type=float, default=1e-8, help="Epsilon for adamw/lamb")
+    p.add_argument("--cooldown-ratio", type=float, default=0.016,
+                   help="for --lr-schedule warmup_cosine_cooldown: fraction of steps for the final linear cooldown to 0")
+    p.add_argument("--warmup-ratio", type=float, default=0.016,
+                   help="if >0, warmup steps = warmup_ratio * max_steps (overrides --warmup-steps)")
     p.add_argument("--label-smoothing", type=float, default=0.0, help="Label smoothing for cross entropy")
     p.add_argument("--weight-decay", type=float, default=0.1)
     p.add_argument("--grad-clip", type=float, default=1.0)
@@ -247,11 +253,19 @@ def run_pretrain(args: argparse.Namespace) -> None:
             {"params": adamw_decay, "weight_decay": args.weight_decay},
             {"params": adamw_no_decay, "weight_decay": 0.0}
         ], lr=args.lr, betas=(0.9, 0.95)))
+    elif args.optimizer == "lamb":
+        opts.append(Lamb(
+            build_param_groups(model, args.weight_decay),
+            lr=args.lr,
+            betas=(0.9, 0.98),
+            eps=args.optimizer_eps,
+        ))
     else:
         opts.append(torch.optim.AdamW(
             build_param_groups(model, args.weight_decay),
             lr=args.lr,
             betas=(0.9, 0.98),
+            eps=args.optimizer_eps,
         ))
 
     logger = build_logger(args.wandb, args.wandb_project, args.run_name)

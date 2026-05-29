@@ -12,12 +12,12 @@ def main():
     subparsers = parser.add_subparsers(dest="command", required=True, help="Available commands")
 
     p_tok = subparsers.add_parser("train-tokenizer", help="Train the tokenizer from scratch")
-    p_tok.add_argument("--vocab-size", type=int, default=8192)
+    p_tok.add_argument("--vocab-size", type=int, default=16384)
     p_tok.add_argument("--save-path", type=str, default="models/tokenizer.json")
     p_tok.add_argument("--visualize-tokenizer", action="store_true")
 
     p_corp = subparsers.add_parser("tokenize-corpus", help="Tokenize HF dataset to a flat uint16 bin")
-    p_corp.add_argument("--tokenizer", type=str, default="models/tokenizer.json")
+    p_corp.add_argument("--tokenizer", type=str, default="models/gpt-bert-official.json")
     p_corp.add_argument("--output", type=str, default="data/train.bin")
     p_corp.add_argument("--dataset", type=str, default="BabyLM-community/BabyLM-2026-Strict-Small")
     p_corp.add_argument("--split", type=str, default="train")
@@ -26,7 +26,7 @@ def main():
                         help="remove CHILDES-style `*SPEAKER:\\t` prefix from each utterance")
     p_corp.add_argument("--insert-sep", action="store_true",
                         help="append [SEP] token between documents (utterance boundaries)")
-    p_corp.add_argument("--source-mode", choices=["hf", "raw"], default="hf",
+    p_corp.add_argument("--source-mode", choices=["hf", "raw"], default="raw",
                         help="hf: load flattened HF dataset (one utterance per row); "
                              "raw: parse per-source txt files in --raw-dir, grouping utterances "
                              "into conversations/articles and inserting [SEP] only at those boundaries")

@@ -80,7 +80,9 @@ def tokenize_from_raw(
         raise ValueError("vocab too large for uint16 storage")
     sep_id = tokenizer.token_to_id("[SEP]")
     if sep_id is None:
-        raise ValueError("tokenizer has no [SEP] token; raw mode always inserts SEP between docs")
+        sep_id = tokenizer.token_to_id("</s>")  # official GPT-BERT tokenizer uses </s>
+    if sep_id is None:
+        raise ValueError("tokenizer has no [SEP]/</s> token; raw mode always inserts a doc separator")
 
     raw_dir = Path(raw_dir)
     tokens: list[int] = []
@@ -96,7 +98,9 @@ def tokenize_from_raw(
         n_docs = 0
         n_tokens_before = len(tokens)
         for doc in tqdm(iterator, desc=f"  {stem}"):
-            tokens.extend(tokenizer.encode(doc).ids)
+            # add_special_tokens=False: the tokenizer's template would auto-prepend <s> to every
+            # doc; we keep the stream clean (just doc tokens + a sep) so consumers control <s>.
+            tokens.extend(tokenizer.encode(doc, add_special_tokens=False).ids)
             tokens.append(sep_id)
             n_docs += 1
         n_docs_total += n_docs
@@ -124,9 +128,9 @@ def tokenize_corpus(
     if tokenizer.get_vocab_size() > 65535:
         raise ValueError("vocab too large for uint16 storage")
 
-    sep_id = tokenizer.token_to_id("[SEP]") if insert_sep else None
+    sep_id = (tokenizer.token_to_id("[SEP]") or tokenizer.token_to_id("</s>")) if insert_sep else None
     if insert_sep and sep_id is None:
-        raise ValueError("tokenizer has no [SEP] token; cannot --insert-sep")
+        raise ValueError("tokenizer has no [SEP]/</s> token; cannot --insert-sep")
 
     dataset = load_dataset(dataset_name, split=split)
 
@@ -143,7 +147,7 @@ def tokenize_corpus(
             text = new
             if not text:
                 continue
-        tokens.extend(tokenizer.encode(text).ids)
+        tokens.extend(tokenizer.encode(text, add_special_tokens=False).ids)
         if insert_sep:
             tokens.append(sep_id)
 

@@ -1,6 +1,6 @@
 #!/bin/bash
 #PBS -N BabyLM_Full_Pipeline
-#PBS -l walltime=1:00:00
+#PBS -l walltime=4:00:00
 #PBS -l select=1:ncpus=4:ngpus=1:mem=32gb:scratch_local=50gb:gpu_mem=40gb
 #PBS -m abe
 #PBS -j oe
@@ -60,12 +60,13 @@ uv sync --link-mode=copy
 # --- Execution ---
 
 # 3. Tokenize
-# DATA_ARGS controls corpus preprocessing. Three useful modes:
-#   raw (current default): -v DATA_ARGS=""           (no preprocessing, HF flat dataset)
+# DATA_ARGS controls corpus preprocessing. The default reproduces our best baseline run: raw
+# per-source files segmented into documents, text kept verbatim (no tag stripping — the official
+# cleans nothing). Other modes:
+#   HF flat (utterances):  -v DATA_ARGS=""
 #   strip+utterance SEP:   -v DATA_ARGS="--strip-speaker-tags --insert-sep"
-#   conversation SEP:      -v DATA_ARGS="--source-mode raw --raw-dir data/raw"
 # The bin is rebuilt in-scratch every job, so DATA_ARGS is what trains.
-DATA_ARGS=${DATA_ARGS:-}
+DATA_ARGS=${DATA_ARGS:-"--source-mode raw --raw-dir data/raw"}
 
 # Always pull the raw per-source txt files (55 MB total) so --source-mode raw works.
 mkdir -p data/raw
@@ -76,20 +77,29 @@ for src in childes simple_wiki gutenberg open_subtitles bnc_spoken switchboard; 
     fi
 done
 
-uv run python main.py train-tokenizer --vocab-size 8192
+# Tokenizer: default is the official GPT-BERT tokenizer (our best baseline). To instead train our
+# own 16384 BPE, pass -v TOKENIZER=models/tokenizer.json.
+TOKENIZER=${TOKENIZER:-models/gpt-bert-official.json}
+if [ "$TOKENIZER" = "models/gpt-bert-official.json" ]; then
+    bash scripts/fetch_tokenizer.sh "$TOKENIZER"   # download the official tokenizer from the HF Hub
+fi
+if [ "$TOKENIZER" = "models/tokenizer.json" ]; then
+    uv run python main.py train-tokenizer --vocab-size 16384
+fi
 # shellcheck disable=SC2086  # intentional word splitting on DATA_ARGS
-uv run python main.py tokenize-corpus --tokenizer models/tokenizer.json --output data/train.bin $DATA_ARGS
+uv run python main.py tokenize-corpus --tokenizer "$TOKENIZER" --output data/train.bin $DATA_ARGS
 
 # 4. Pretrain + inline eval (logs eval metrics to the live wandb run before finishing).
-# All arch/training hyperparams default to the values in add_pretrain_args().
-# Override any subset via ARGS:
-#   qsub -v ARGS="--run-name foo --pos-emb rope --rope-base 1000" scripts/submit_babylm.sh
-# To ablate preprocessing (e.g. the old raw bin), also pass:
-#   -v DATA_ARGS=""
+# A bare run reproduces our best baseline (defaults live in add_pretrain_args; official tokenizer +
+# raw document data are set above). Override any subset via ARGS, e.g.:
+#   qsub -v ARGS="--pos-emb rope --rope-base 1000" scripts/submit_babylm.sh
+# Document-packing variant (targets entity_tracking):
+#   qsub -v ARGS="--document-packing" scripts/submit_babylm.sh
 ARGS=${ARGS:-}
 
 # shellcheck disable=SC2086  # intentional word splitting on ARGS
 uv run python main.py pretrain \
+    --tokenizer "$TOKENIZER" \
     --output-dir checkpoints/ \
     --wandb \
     --eval fast \

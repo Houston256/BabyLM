@@ -32,6 +32,9 @@ def main():
                              "into conversations/articles and inserting [SEP] only at those boundaries")
     p_corp.add_argument("--raw-dir", type=str, default="data/raw",
                         help="directory containing {childes,simple_wiki,gutenberg,open_subtitles,bnc_spoken,switchboard}.train.txt")
+    p_corp.add_argument("--chunk-words", type=int, default=0,
+                        help="raw mode: split delimiter-less sources (open_subtitles/bnc_spoken/"
+                             "switchboard) into ~N-word pseudo-documents (<=0 = one doc per file, default)")
 
     p_pre = subparsers.add_parser("pretrain", help="Pretrain GPT-BERT v0")
     add_pretrain_args(p_pre)
@@ -54,6 +57,7 @@ def main():
                 output_path=args.output,
                 raw_dir=args.raw_dir,
                 strip_speaker_tags=args.strip_speaker_tags,
+                chunk_words=args.chunk_words,
             )
         else:
             tokenize_corpus(

@@ -40,16 +40,27 @@ def _iter_docs_with_headers(path: Path, strip_speaker_tags: bool) -> Iterator[st
         yield " ".join(buf)
 
 
-def _iter_docs_flat(path: Path) -> Iterator[str]:
-    """No document structure available — yield the whole file as one document.
+def _iter_docs_chunked(path: Path, target_words: int) -> Iterator[str]:
+    """Yield ~`target_words`-word pseudo-documents, cut at line boundaries.
 
-    Used for open_subtitles, bnc_spoken, switchboard — sources where the original
-    document boundaries weren't preserved during preprocessing.
+    Strips each line and joins with a single space. `target_words <= 0` emits the
+    whole file as one document.
     """
+    buf: list[str] = []
+    n_words = 0
     with path.open() as f:
-        chunk = " ".join(line.strip() for line in f if line.strip())
-    if chunk:
-        yield chunk
+        for raw in f:
+            line = raw.strip()
+            if not line:
+                continue
+            buf.append(line)
+            n_words += line.count(" ") + 1
+            if 0 < target_words <= n_words:
+                yield " ".join(buf)
+                buf = []
+                n_words = 0
+    if buf:
+        yield " ".join(buf)
 
 
 # Per-source parser dispatch. Keys are filename stems under raw_dir.
@@ -57,9 +68,9 @@ _RAW_SOURCES: dict[str, str] = {
     "childes":        "headers",
     "simple_wiki":    "headers",
     "gutenberg":      "headers",
-    "open_subtitles": "flat",
-    "bnc_spoken":     "flat",
-    "switchboard":    "flat",
+    "open_subtitles": "chunked",
+    "bnc_spoken":     "chunked",
+    "switchboard":    "chunked",
 }
 
 
@@ -68,6 +79,7 @@ def tokenize_from_raw(
     output_path: str | Path,
     raw_dir: str | Path,
     strip_speaker_tags: bool = False,
+    chunk_words: int = 0,
 ) -> None:
     """Tokenize from the raw per-source txt files, preserving document granularity.
 
@@ -93,7 +105,7 @@ def tokenize_from_raw(
             raise FileNotFoundError(f"missing raw source: {path}")
         iterator = (
             _iter_docs_with_headers(path, strip_speaker_tags) if mode == "headers"
-            else _iter_docs_flat(path)
+            else _iter_docs_chunked(path, chunk_words)
         )
         n_docs = 0
         n_tokens_before = len(tokens)
